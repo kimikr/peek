@@ -1,0 +1,5 @@
+version: 1
+bundleID: kim.jihwan.peek
+product: Peek
+infoPath: Peek-Info.plist
+iconPath: AppIcon.png

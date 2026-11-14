@@ -1,0 +1,246 @@
+# peek
+
+**SwiftUI previews on a real iPhone, built on Linux. No Mac.**
+
+![Editing a SwiftUI view on Linux; the iPhone updates a second later](docs/demo.gif)
+
+Save a file, and a second or two later the view on your phone is replaced with
+the new one. It is your real code, compiled by the real Swift compiler and
+drawn by the real SwiftUI on the device, so every API, animation and gesture
+behaves exactly as it will in your app.
+
+- **Fast.** Incremental builds: an edit in a 2,000-line app is on the phone in 1–2 s.
+- **Your whole app.** `#Preview` blocks, UIKit views and controllers, or the
+  entire `@main` App, with package dependencies, macros and resources.
+- **No Mac, no paid account.** A free Apple ID and SideStore, AltStore or
+  LiveContainer is enough.
+- **Logs and screenshots.** `print()` output shows up in your terminal, and
+  `peek shot` saves a screenshot of the phone.
+- **One file, no dependencies.** The dev server is a single Python script
+  (standard library only) next to xtool's Swift toolchain.
+
+```
+$ peek dev MyApp/
+[12:06:52] built + signed in 1.3s → v1 (Counter, List)
+```
+
+> **Status: early.** See [what has been tested](#tested).
+
+## How it works
+
+```
+ Linux                                         iPhone
+ ─────                                         ──────
+ *.swift ──swiftc + iOS SDK──▶ preview.dylib
+                 │ sign with your dev certificate
+                 ▼
+            peek dev server ── encrypted HTTP ──▶  Peek app: dlopen() → UIHostingController
+```
+
+1. `peek dev` watches your sources. On every change it cross-compiles them
+   into an arm64 iOS dynamic library (`#Preview` blocks become entry points).
+   Compilation is incremental: only the files an edit affects are compiled
+   again, so a save in a 2,000-line app takes 1–2 s instead of 9.
+2. It signs the library with your development certificate.
+3. The Peek app on the phone long-polls the server, downloads the new
+   library, `dlopen()`s it and shows the preview.
+
+Package dependencies are linked into a separate library that the phone
+downloads once and keeps, so each reload only carries your own code.
+
+iOS refuses to load code that is not signed by a certificate in a provisioning
+profile on the device with the same Team ID as the running app. So the library
+must be signed with the certificate your sideloading store (SideStore /
+AltStore) signed the Peek app with. The app asks the store for that
+certificate once and sends it, encrypted, to your dev server.
+
+The signature also has to carry the right *identifier*. A free Apple ID's
+profile covers one explicit app ID, and iOS matches code that has no
+entitlements of its own against it by signing identifier, so a library signed
+under any other name is rejected as `code signature invalid` even with the
+right certificate. The app therefore tells the server the bundle identifier of
+the process it runs in, and the server signs every build under that name.
+
+## Requirements
+
+On the Linux machine:
+
+- Swift 6 toolchain and the Darwin Swift SDK, both from
+  [xtool](https://github.com/xtool-org/xtool) (`xtool setup`)
+- [`ldid`](https://github.com/ProcursusTeam/ldid) and `openssl`
+- Python 3.9+ (standard library only)
+
+On the iPhone (iOS 17+):
+
+- SideStore or AltStore, to install the Peek app, or
+  [LiveContainer](https://github.com/LiveContainer/LiveContainer) set up in
+  JIT-less mode, to run it without using one of your three app slots
+- The phone and the Linux machine on the same Wi-Fi **or** the same
+  [Tailscale](https://tailscale.com) network
+
+## Quick start
+
+```sh
+# 1. Build the host app and install the IPA with SideStore/AltStore
+cd host && xtool dev build --ipa -c release     # → host/xtool/Peek.ipa
+
+# 2. Start previewing
+./peek dev examples/Counter
+```
+
+Or skip step 1 and install the IPA attached to a
+[release](../../releases) (built with `scripts/release-ipa.sh`; the store signs
+it for you).
+
+`peek dev` prints a QR code and a pairing link. Scan the code with the Camera
+app (Peek asks you to confirm the server) or paste the link into Peek. The
+first time, tap **Import from SideStore** in the app to hand over the signing
+certificate.
+
+**Inside LiveContainer.** Install the IPA in LiveContainer instead. The store
+cannot call back into a guest app, so export the certificate from the store as
+a `.p12` file and use **Import a .p12 file…**. It must be the certificate
+LiveContainer itself is signed with.
+
+Then edit `examples/Counter/ContentView.swift` and save.
+
+### What gets previewed
+
+- Every `#Preview { ... }` block (switch between them from the green dot menu
+  in the app). `@Previewable` works, and a preview may return a SwiftUI
+  view, a `UIViewController` or a `UIView`.
+- Without any `#Preview`: the whole app. The `@main` App's first
+  `WindowGroup` is shown as a view (`--app` forces this even when previews
+  exist). Other scenes are left out, scene modifiers (`.commands`,
+  `.defaultSize`, …) are ignored, and `@UIApplicationDelegateAdaptor` creates
+  your delegate and calls `application(_:didFinishLaunchingWithOptions:)`.
+- Otherwise `ContentView`, or the first `View` struct found.
+- Or say it explicitly: `peek dev . --root "SettingsView(model: .sample)"`.
+
+### What gets compiled
+
+| You run | peek compiles |
+| --- | --- |
+| `peek dev File.swift` | just that file |
+| `peek dev Folder/` | every `.swift` file under `Folder/Sources` (or `Folder/`) |
+| `peek dev Package/` (has a `Package.swift`) | the app's target, linked against its package dependencies |
+
+**Build settings.** In a package, the previewed target's Swift language mode
+and `swiftSettings` (`define`, upcoming and experimental features, default
+isolation, `unsafeFlags`) and linker settings are applied.
+
+**Package dependencies.** In a package, peek first builds everything with
+SwiftPM (`swift build`, the same way xtool does), links the dependencies into
+one library the phone downloads once, and runs the macros SwiftPM built.
+That first build is slow; after it, saving a file in the previewed target takes
+the fast path again. Editing `Package.swift` or a dependency's sources triggers
+the SwiftPM build again. Use `--target` to pick a target other than the app's.
+
+**Resources.** `Image("photo", bundle: .module)`, `Bundle.module.url(...)`
+and custom fonts work: resource bundles (the previewed target's and its
+dependencies') are sent to the phone alongside the build. Outside a package,
+files in folders named `Resources` are bundled the same way. Asset catalogs
+cannot be compiled without a Mac, so image sets in `.xcassets` are sent as
+loose images (found by `Image("name", bundle: .module)`); colour sets are not
+available.
+
+See `examples/Weather` for a package with a dependency and a resource.
+
+### While previewing
+
+- **Output.** `print()` and anything else written to stdout or stderr shows
+  up in the `peek dev` terminal, prefixed with `│`. When a build crashes the
+  app, its last output (a `fatalError` message, say) is sent the next time
+  Peek starts.
+- **Screenshots.** `peek shot` saves what the phone is showing as a PNG
+  (`-o file.png` to name it).
+- **Display.** The menu (green dot) switches the preview between light and
+  dark appearance and between text sizes, without touching the phone's
+  settings.
+- **Errors.** A compile error is shown over the last preview that worked. So
+  is a build that fails to load: the previous one stays on screen.
+
+### Finding the server
+
+The pairing link holds the server's addresses. On the same Wi-Fi the server
+also advertises itself with Bonjour (`_peek._tcp`), so an already paired phone
+finds it again when its address changes. Over Tailscale, the Tailscale address
+in the link is used. Pair with `peek link --qr` at any time.
+
+## Limitations
+
+- **State resets on every reload.** A new build is a new set of types.
+- **Rebuild time.** The first build of a project compiles everything (about
+  9 s for 2,000 lines on a 2-core machine); after that an edit takes 1–2 s.
+  Every build is loaded under the same module name; if that causes trouble,
+  `--no-incremental` builds each version as a module of its own.
+- **Dependencies:** Swift targets and macros. C-family targets and binary
+  (`.xcframework`) targets are not handled yet; pass extra compiler flags with
+  `--swiftc-flag`.
+- **Apps built on `DocumentGroup`** cannot be previewed as a whole app; use
+  `#Preview` or `--root`.
+- **The preview lives in the Peek app's sandbox.** `UserDefaults`, the
+  keychain and files are Peek's, so nothing your installed app has saved
+  (settings, logins, caches) is there.
+- **`Bundle.main` is the Peek app's bundle**, so `Image("name")` without
+  `bundle: .module`, your `Info.plist` keys, URL schemes, app extensions and
+  entitlements (HealthKit, push, iCloud, App Groups, …) are not your app's.
+- **A crash in your view crashes the Peek app.** It will not reload the same
+  build automatically after that.
+- **Previewing Peek with Peek** shows "The last build quit the app" in the
+  inner copy, because both copies share one set of preferences.
+- **Old builds stay in memory** until the app is restarted (dependencies
+  are loaded once).
+- **Free Apple IDs:** the certificate changes when the store re-issues it;
+  import it again when builds stop loading.
+
+## Security
+
+- The dev server only listens while `peek dev` runs, and only on the addresses
+  in the pairing link and on loopback, not on every interface. Use `--bind` to
+  choose another one.
+- The pairing link contains a random 128-bit key that is shown on your
+  terminal and never sent over the network. Requests are authenticated with
+  HMAC-SHA256 over the method, path, time, body and the headers the server
+  acts on. Everything the server sends (builds, compiler output, resources)
+  and everything sensitive the phone sends (the certificate, screenshots) is
+  encrypted with AES-256-CTR and authenticated with HMAC-SHA256, using keys
+  derived from it.
+- A pairing link opened from outside the app (Camera, Safari, another app)
+  must be confirmed before Peek connects, and a certificate handed over by
+  another app is only accepted right after you asked the store for it. A web
+  page cannot silently point Peek at someone else's server.
+- The certificate password never appears on a command line (`ps`); files
+  holding key material are created readable by you only.
+- Your signing certificate and private key are stored on the Linux machine in
+  `~/.peek/cert.p12` (mode 0600). Anyone who can read it can sign code that
+  your phone will run inside sideloaded apps. Delete it when you are done on a
+  shared machine.
+- The connection itself is plain HTTP, so the request lines (paths such as
+  `/v1/dylib/12`) and sizes are visible on the network; the contents are not.
+  A request captured on the network could be replayed within its 5-minute
+  window; that only repeats something the phone already did, and the reply is
+  still encrypted.
+
+## Tested
+
+| | |
+| --- | --- |
+| iPhone, iOS 27, Peek inside LiveContainer (SideStore, free Apple ID), Tailscale | ✅ loads and hot-reloads Counter, Peek itself, and two real apps (resources, a local package, the iOS 26 tab bar) |
+| Builds on Linux: examples, three real apps, UIKit previews, App rewriting | ✅ |
+| Server test suite (`python3 -m unittest discover tests`) | ✅ |
+| On that phone: encrypted protocol, incremental reload, dependency library, `print()` output, `peek shot`, light/dark and text size | ✅ |
+| Peek installed directly with SideStore / AltStore | ⏳ not yet |
+| Bonjour discovery on a real Wi-Fi network | ⏳ not yet |
+
+## Development
+
+```sh
+python3 -m unittest discover tests     # server tests (Python + openssl only)
+./peek build examples/Weather          # compile once, print errors
+scripts/release-ipa.sh                 # unsigned IPA for a release
+```
+
+## License
+
+MIT

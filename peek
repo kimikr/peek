@@ -1,0 +1,1962 @@
+#!/usr/bin/env python3
+"""peek — SwiftUI previews on a real iPhone, built on Linux (no Mac).
+
+`peek dev <path>` watches Swift sources, cross-compiles them into an iOS dylib
+with the real Swift compiler + iOS SDK, signs it, and serves it to the Peek
+host app on the phone, which dlopen()s it and shows the view with real SwiftUI.
+
+Only the Python standard library is used. External tools: swiftc with a Darwin
+Swift SDK (as installed by xtool), ldid, openssl.
+"""
+import argparse
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+VERSION = "0.1.0"
+STATE_DIR = Path(os.environ.get("PEEK_HOME", Path.home() / ".peek"))
+SKIP_DIRS = {".build", ".git", ".peek", "Tests", "xtool", "node_modules", ".swiftpm"}
+AUTH_WINDOW = 300  # seconds of clock skew tolerated on signed requests
+
+
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def printable(text):
+    """Text from the phone with terminal control characters (escape sequences) removed."""
+    return CONTROL_RE.sub("", str(text))
+
+
+def private_dir():
+    """The state folder, readable by this user only (it holds the signing key)."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+    return STATE_DIR
+
+
+def write_private(path, data):
+    """Writes a file created with mode 0600."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data if isinstance(data, bytes) else data.encode())
+    os.chmod(path, 0o600)
+
+
+def log(msg, color=None):
+    codes = {"red": 31, "green": 32, "yellow": 33, "dim": 2, "bold": 1}
+    stamp = time.strftime("%H:%M:%S")
+    msg = printable(msg)
+    if color and sys.stdout.isatty():
+        msg = f"\033[{codes[color]}m{msg}\033[0m"
+    print(f"[{stamp}] {msg}", flush=True)
+
+
+# ---------------------------------------------------------------- toolchain
+
+class Toolchain:
+    """Locates swiftc, the Darwin Swift SDK bundle, and ldid."""
+
+    def __init__(self):
+        self.swiftc = self._find("swiftc", [Path.home() / ".local/share/swiftly/bin/swiftc"])
+        self.ldid = self._find("ldid", [Path.home() / ".local/bin/ldid"])
+        self.openssl = self._find("openssl", [])
+        self.sdk = self.resources = self.linker = self.runtime = self.bundle = None
+        for root in (Path.home() / ".swiftpm/swift-sdks", Path.home() / "Library/org.swift.swiftpm/swift-sdks"):
+            for manifest in sorted(root.glob("*.artifactbundle/swift-sdk.json")):
+                try:
+                    triple = json.loads(manifest.read_text())["targetTriples"]["arm64-apple-ios"]
+                except (KeyError, ValueError):
+                    continue
+                bundle = self.bundle = manifest.parent
+                self.sdk = bundle / triple["sdkRootPath"]
+                self.resources = bundle / triple["swiftResourcesPath"]
+                linker = bundle / "toolset/bin/ld64.lld"
+                self.linker = linker if linker.exists() else None
+                runtime = sorted(self.resources.parent.glob("clang/*/lib/darwin/libclang_rt.ios.a"))
+                self.runtime = runtime[-1] if runtime else None
+        missing = [n for n, v in (("swiftc", self.swiftc), ("ldid", self.ldid), ("openssl", self.openssl),
+                                  ("a Darwin Swift SDK (install with `xtool sdk install`)", self.sdk)) if not v]
+        if missing:
+            sys.exit("peek: missing " + ", ".join(missing))
+
+    def swift_build(self, package_dir, scratch):
+        """Builds a package for iOS the way xtool does (SwiftPM's swiftbuild backend)."""
+        swift = Path(self.swiftc).with_name("swift")
+        cmd = [str(swift) if swift.exists() else "swift", "build", "--configuration", "debug",
+               "--build-system", "swiftbuild", "--triple", "arm64-apple-ios", "--scratch-path", str(scratch)]
+        for name in ("toolset-swb.json", "toolset.json"):
+            if (self.bundle / name).exists():
+                cmd += ["--toolset", str(self.bundle / name)]
+                break
+        return subprocess.run(cmd, cwd=package_dir, capture_output=True, text=True, env=self.swift_env())
+
+    def swift_env(self):
+        env = dict(os.environ)
+        env["XCODE_EXTRA_PLATFORM_FOLDERS"] = str(self.bundle / "Developer/Platforms")
+        env["PATH"] = f"{self.bundle / 'toolset/bin'}:{Path(self.swiftc).parent}:{env.get('PATH', '')}"
+        return env
+
+    @staticmethod
+    def _find(name, extra):
+        found = shutil.which(name)
+        if found:
+            return found
+        for candidate in extra:
+            if candidate.exists():
+                return str(candidate)
+        return None
+
+
+# ------------------------------------------------------------ source rewrite
+
+def _string_end(src, i):
+    """If src[i] starts a string literal (plain, multi-line or raw), return the index just past it; else i.
+
+    Interpolations (`\\(...)`, `\\#(...)` in raw strings) may hold code with strings of their own.
+    """
+    j = i
+    while j < len(src) and src[j] == "#":
+        j += 1
+    hashes = j - i
+    if not src.startswith('"', j):
+        return i
+    multi = src.startswith('"""', j)
+    close = ('"""' if multi else '"') + "#" * hashes
+    escape = "\\" + "#" * hashes
+    j += 3 if multi else 1
+    while j < len(src):
+        if src.startswith(escape, j):
+            k = j + len(escape)
+            if k < len(src) and src[k] == "(":
+                end = match_close(src, k)
+                if end < 0:
+                    return len(src)
+                j = end + 1
+            else:
+                j = k + 1
+            continue
+        if src.startswith(close, j):
+            return j + len(close)
+        if not multi and src[j] == "\n":
+            return j
+        j += 1
+    return len(src)
+
+
+def skip_trivia(src, i):
+    """If src[i] starts a comment, string or regex literal, return the index just past it; else i."""
+    if src.startswith("//", i):
+        end = src.find("\n", i)
+        return len(src) if end < 0 else end
+    if src.startswith("/*", i):  # Swift block comments nest
+        depth, j = 1, i + 2
+        while j < len(src) and depth:
+            if src.startswith("/*", j):
+                depth, j = depth + 1, j + 2
+            elif src.startswith("*/", j):
+                depth, j = depth - 1, j + 2
+            else:
+                j += 1
+        return j
+    if src[i] in '"#':
+        end = _string_end(src, i)
+        if end != i:
+            return end
+        if src.startswith("#/", i):  # extended regex literal
+            end = src.find("/#", i + 2)
+            return len(src) if end < 0 else end + 2
+    return i
+
+
+def match_close(src, open_idx):
+    """Index of the bracket closing the one at open_idx, or -1."""
+    pairs = {"{": "}", "(": ")", "[": "]"}
+    opener, closer = src[open_idx], pairs[src[open_idx]]
+    depth, i = 0, open_idx
+    while i < len(src):
+        j = skip_trivia(src, i)
+        if j != i:
+            i = j
+            continue
+        if src[i] == opener:
+            depth += 1
+        elif src[i] == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def code_mask(src):
+    """Copy of src with comments and string literals blanked, for safe regex matching."""
+    out, i = list(src), 0
+    while i < len(src):
+        j = skip_trivia(src, i)
+        if j != i:
+            for k in range(i, min(j, len(src))):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = j
+        else:
+            i += 1
+    return "".join(out)
+
+
+PREVIEW_RE = re.compile(r"#Preview\b")
+MAIN_RE = re.compile(r"@main\b")
+APP_RE = re.compile(r"@main\s+(?:\w+\s+)*?struct\s+(\w+)\s*:\s*([^{]*)\{")
+VIEW_STRUCT_RE = re.compile(r"\bstruct\s+(\w+)\s*(?:<[^>{]*>)?\s*:\s*[^{]*\bView\b[^{]*\{")
+SCENE_RE = re.compile(r"\b(WindowGroup|Window|DocumentGroup|Settings|MenuBarExtra|ImmersiveSpace|UtilityWindow)\b")
+
+
+def _blank(text):
+    """Keeps only the newlines of text, so line numbers stay the same."""
+    return "\n" * text.count("\n")
+
+
+def _scene_end(src, start):
+    """End of a scene expression `Name(args) { content }` starting at start (before any modifiers)."""
+    end = start
+    while end < len(src) and (src[end].isalnum() or src[end] == "_"):
+        end += 1
+    while True:
+        j = end
+        while j < len(src) and src[j] in " \t\n":
+            j += 1
+        if j < len(src) and src[j] in "({" and (src[j] == "{" or j == end):
+            close = match_close(src, j)
+            if close < 0:
+                return end
+            end = close + 1
+            if src[j] == "{":
+                return end
+        else:
+            return end
+
+
+def _rewrite_app(src, mask, m, edits):
+    """The @main App at match m becomes a view showing its first window's content."""
+    close = match_close(src, m.end() - 1)
+    conformance = re.search(r"\bApp\b", m.group(2))
+    if not conformance or close < 0:
+        return None
+    start = m.start(2) + conformance.start()
+    edits.append((start, start + 3, "SwiftUI.View"))
+    for scene in re.finditer(r"\bsome\s+Scene\b", mask[m.end():close]):
+        edits.append((m.end() + scene.start(), m.end() + scene.end(), "some SwiftUI.View"))
+    for adaptor in re.finditer(r"@UIApplicationDelegateAdaptor\b", mask[m.end():close]):
+        edits.append((m.end() + adaptor.start(), m.end() + adaptor.end(), "@__PeekDelegateAdaptor"))
+    body = re.search(r"\bvar\s+body\s*:\s*some\s+Scene\s*\{", mask[m.end():close])
+    if not body:
+        return m.group(1)
+    body_start = m.end() + body.end()
+    body_end = match_close(src, body_start - 1)
+    first, done = True, body_start
+    for scene in SCENE_RE.finditer(mask[body_start:body_end]):
+        begin = body_start + scene.start()
+        if begin < done or mask[begin - 1] == "." or mask[begin - 1].isalnum():
+            continue  # inside an earlier scene, or a member such as `.Settings`
+        end = done = _scene_end(src, begin)
+        if first and scene.group(1) == "WindowGroup":
+            # WindowGroup("Title", id: ...) arguments mean nothing to a view.
+            name_end = body_start + scene.end()
+            body = name_end
+            while body < end and src[body] in " \t\n":
+                body += 1
+            if src[body:body + 1] == "(":
+                body = match_close(src, body) + 1
+            edits.append((begin, body, "SwiftUI.Group" + _blank(src[begin:body])))
+        elif first:
+            continue  # e.g. DocumentGroup: not supported, left as is
+        else:
+            # Further windows, settings and other scenes are not shown.
+            edits.append((begin, end, "SwiftUI.EmptyView()" + _blank(src[begin:end])))
+        first = False
+    return m.group(1)
+
+
+def _rewrite_preview(src, m, name):
+    """The `#Preview` at match m as (start, end, struct source, title), or None."""
+    i = m.end()
+    while i < len(src) and src[i] in " \t":
+        i += 1
+    title = None
+    if i < len(src) and src[i] == "(":
+        close = match_close(src, i)
+        if close < 0:
+            return None
+        t = re.match(r'\(\s*"((?:[^"\\]|\\.)*)"', src[i:close + 1])
+        title = t.group(1) if t else None
+        i = close + 1
+        while i < len(src) and src[i] in " \t\n":
+            i += 1
+    if i >= len(src) or src[i] != "{":
+        return None
+    close = match_close(src, i)
+    if close < 0:
+        return None
+    lines = src[i + 1:close].split("\n")
+    masked = code_mask(src[i + 1:close]).split("\n")
+    body_open, depth = False, 0
+    for n, line in enumerate(lines):
+        code = masked[n]
+        if depth > 0:  # continuation of a multi-line @Previewable declaration
+            depth += sum(code.count(c) for c in "([{") - sum(code.count(c) for c in ")]}")
+            continue
+        if not code.strip():
+            continue
+        if code.strip().startswith("@Previewable"):
+            lines[n] = line.replace("@Previewable", "", 1)
+            depth = sum(code.count(c) for c in "([{") - sum(code.count(c) for c in ")]}")
+            continue
+        lines[n] = "var body: some SwiftUI.View { __peekPreview { " + line
+        body_open = True
+        break
+    if not body_open:
+        return None
+    head = f"struct {name}: SwiftUI.View {{" + _blank(src[m.start():i])  # keep line numbers stable
+    return m.start(), close + 1, head + "\n".join(lines) + "} } }", title
+
+
+def rewrite_source(src, tag="0"):
+    """Makes a source file previewable without changing its line numbers.
+
+    - each `#Preview { ... }` becomes a view struct `__PeekRoot_<tag>_<n>` the entry point can show
+      (its body may build a SwiftUI view, a UIViewController or a UIView);
+    - the `@main` App becomes a plain view showing its first WindowGroup's content, so a whole
+      app can be previewed even when it has no #Preview.
+    Returns (new_source, [(struct_name, title or None)], app_struct_name or None).
+    """
+    roots, app = [], None
+    mask = code_mask(src)
+    edits = []  # (start, end, replacement)
+    for m in MAIN_RE.finditer(mask):
+        edits.append((m.start(), m.end(), " " * (m.end() - m.start())))
+    for m in APP_RE.finditer(mask):
+        app = _rewrite_app(src, mask, m, edits) or app
+    for m in PREVIEW_RE.finditer(mask):
+        name = f"__PeekRoot_{tag}_{len(roots)}"
+        found = _rewrite_preview(src, m, name)
+        if found:
+            start, end, text, title = found
+            edits.append((start, end, text))
+            roots.append((name, title))
+    for start, end, text in sorted(edits, reverse=True):
+        src = src[:start] + text + src[end:]
+    return src, roots, app
+
+
+ENTRY_TEMPLATE = """\
+// Generated by peek. Do not edit.
+import SwiftUI
+import UIKit
+
+@_cdecl("peek_entry")
+public func __peekEntry(_ index: Int32) -> UnsafeMutableRawPointer? {
+    let controller: UIViewController? = MainActor.assumeIsolated {
+        switch index {
+%CASES%
+        default: return nil
+        }
+    }
+    guard let controller else { return nil }
+    return Unmanaged.passRetained(controller).toOpaque()
+}
+"""
+
+# Compiled once and kept by incremental builds: helpers the rewritten sources refer to.
+SUPPORT_SOURCE = """\
+// Generated by peek. Do not edit.
+import SwiftUI
+import UIKit
+
+// A #Preview body may produce a SwiftUI view, a view controller or a UIKit view.
+func __peekPreview<V: SwiftUI.View>(@SwiftUI.ViewBuilder _ make: () -> V) -> SwiftUI.AnyView {
+    SwiftUI.AnyView(make())
+}
+
+@_disfavoredOverload @MainActor func __peekPreview(_ make: () -> UIViewController) -> SwiftUI.AnyView {
+    SwiftUI.AnyView(__PeekControllerView(controller: make()).ignoresSafeArea())
+}
+
+@_disfavoredOverload @MainActor func __peekPreview(_ make: () -> UIView) -> SwiftUI.AnyView {
+    SwiftUI.AnyView(__PeekUIView(view: make()))
+}
+
+struct __PeekControllerView: UIViewControllerRepresentable {
+    let controller: UIViewController
+    func makeUIViewController(context: Context) -> UIViewController { controller }
+    func updateUIViewController(_ controller: UIViewController, context: Context) {}
+}
+
+struct __PeekUIView: UIViewRepresentable {
+    let view: UIView
+    func makeUIView(context: Context) -> UIView { view }
+    func updateUIView(_ view: UIView, context: Context) {}
+}
+
+/// Stands in for @UIApplicationDelegateAdaptor once the App is shown as a view: the delegate
+/// is created once and gets application(_:didFinishLaunchingWithOptions:).
+@MainActor @propertyWrapper struct __PeekDelegateAdaptor<Delegate: NSObject & UIApplicationDelegate>: SwiftUI.DynamicProperty {
+    @SwiftUI.State private var box = __PeekDelegateBox<Delegate>()
+    init(_ type: Delegate.Type = Delegate.self) {}
+    var wrappedValue: Delegate { box.delegate }
+}
+
+@MainActor final class __PeekDelegateBox<Delegate: NSObject & UIApplicationDelegate> {
+    lazy var delegate: Delegate = {
+        let delegate = Delegate()
+        _ = delegate.application?(UIApplication.shared, didFinishLaunchingWithOptions: nil)
+        return delegate
+    }()
+}
+
+// Scene modifiers have no meaning on a view; accept and ignore them.
+extension SwiftUI.View {
+    func commands<Content: SwiftUI.Commands>(@SwiftUI.CommandsBuilder content: () -> Content) -> Self { self }
+    func defaultSize(_ size: CGSize) -> Self { self }
+    func defaultSize(width: CGFloat, height: CGFloat) -> Self { self }
+    func windowResizability(_ resizability: SwiftUI.WindowResizability) -> Self { self }
+    func handlesExternalEvents(matching conditions: Set<String>) -> Self { self }
+    func backgroundTask<D: Sendable, R: Sendable>(_ task: SwiftUI.BackgroundTask<D, R>,
+                                                  action: @escaping @Sendable (D) async -> R) -> Self { self }
+}
+"""
+
+# The Peek app unpacks resource bundles on the phone and points this variable at their folder.
+# SwiftPM's own generated accessor (used by dependencies) honours the same variable in debug builds.
+BUNDLE_TEMPLATE = """
+extension Foundation.Bundle {
+    static let module: Bundle = {
+        let folder = ProcessInfo.processInfo.environment["PACKAGE_RESOURCE_BUNDLE_PATH"] ?? ""
+        return Bundle(path: folder + "/%NAME%.bundle") ?? .main
+    }()
+}
+"""
+
+
+# ------------------------------------------------------------------ package
+
+class Package:
+    """A SwiftPM package whose dependencies are built once by SwiftPM."""
+
+    SKIP_TYPES = {"test", "plugin", "macro", "system-target", "binary", "snippet"}
+
+    def __init__(self, root, toolchain, wanted, scratch):
+        self.root, self.tc, self.scratch = root, toolchain, scratch
+        self.products = scratch / "out/Products/Debug-iphoneos"
+        swift = Path(toolchain.swiftc).with_name("swift")
+        proc = subprocess.run([str(swift) if swift.exists() else "swift", "package", "describe", "--type", "json"],
+                              cwd=root, capture_output=True, text=True, env=toolchain.swift_env())
+        if proc.returncode != 0:
+            raise ValueError((proc.stderr or proc.stdout).strip() or "could not read Package.swift")
+        info = json.loads(proc.stdout[proc.stdout.index("{"):])
+        self.name = info["name"]
+        targets = {t["name"]: t for t in info["targets"] if t.get("type") not in self.SKIP_TYPES}
+        if not targets:
+            raise ValueError("Package.swift has no library or executable target to preview")
+        if not wanted and (root / "xtool.yml").exists():
+            m = re.search(r"^product:\s*(\S+)", (root / "xtool.yml").read_text(), re.M)
+            wanted = m.group(1) if m else None
+        products = {p["name"]: p["targets"] for p in info.get("products", [])}
+        if wanted and wanted not in targets:
+            wanted = next((t for t in products.get(wanted, []) if t in targets), wanted)
+        if not wanted:
+            libraries = [p["targets"][0] for p in info.get("products", [])
+                         if "library" in p.get("type", {}) and p["targets"] and p["targets"][0] in targets]
+            wanted = libraries[0] if libraries else next(iter(targets))
+        if wanted not in targets:
+            raise ValueError(f"no target named {wanted}; targets: {', '.join(targets)}")
+        target = targets[wanted]
+        self.target = wanted
+        self.target_dir = (root / target["path"]).resolve()
+        self.bundle_name = f"{self.name}_{wanted}" if target.get("resources") else None
+        needed, queue = set(), [wanted]
+        while queue:
+            for dep in targets.get(queue.pop(), {}).get("target_dependencies", []):
+                if dep not in needed:
+                    needed.add(dep)
+                    queue.append(dep)
+        # Objects that must not be linked: the previewed module itself and unrelated local targets.
+        self.excluded = {t["c99name"] for name, t in targets.items() if name not in needed}
+        self.local_deps = [Path(d["path"]) for d in info.get("dependencies", []) if d.get("type") == "fileSystem"]
+        # SwiftPM names the root package after its folder; `package` declarations need the same name.
+        self.identity = root.name.lower()
+        self.settings(swift, wanted)
+
+    def settings(self, swift, wanted):
+        """Build settings of the previewed target from Package.swift: language mode and swiftSettings."""
+        self.language_mode, self.swift_flags, self.link_flags = None, [], []
+        proc = subprocess.run([str(swift) if swift.exists() else "swift", "package", "dump-package"],
+                              cwd=self.root, capture_output=True, text=True, env=self.tc.swift_env())
+        try:
+            manifest = json.loads(proc.stdout[proc.stdout.index("{"):])
+        except ValueError:
+            return
+        tools = manifest.get("toolsVersion", {}).get("_version", "5")
+        modes = manifest.get("swiftLanguageModes") or manifest.get("swiftLanguageVersions") or []
+        modes = [m.get("_0", m) if isinstance(m, dict) else m for m in modes]
+        self.language_mode = str(modes[0]) if modes else ("6" if int(tools.split(".")[0]) >= 6 else "5")
+        target = next((t for t in manifest.get("targets", []) if t.get("name") == wanted), {})
+        for setting in target.get("settings", []):
+            condition = setting.get("condition") or {}
+            if condition.get("platformNames") and "ios" not in condition["platformNames"]:
+                continue
+            if condition.get("config") not in (None, "debug"):
+                continue
+            kinds = setting.get("kind")
+            if not isinstance(kinds, dict) or len(kinds) != 1:
+                continue
+            (kind, value), = kinds.items()
+            value = value.get("_0") if isinstance(value, dict) else value
+            tool = setting.get("tool")
+            if kind == "swiftLanguageMode" and value:
+                self.language_mode = str(value)
+            elif kind == "define" and tool == "swift":
+                self.swift_flags += ["-D", value]
+            elif kind == "enableUpcomingFeature":
+                self.swift_flags += ["-enable-upcoming-feature", value]
+            elif kind == "enableExperimentalFeature":
+                self.swift_flags += ["-enable-experimental-feature", value]
+            elif kind == "defaultIsolation" and isinstance(value, str):
+                self.swift_flags += ["-default-isolation", value]
+            elif kind == "unsafeFlags" and tool == "swift":
+                self.swift_flags += list(value)
+            elif kind == "unsafeFlags" and tool == "linker":
+                self.link_flags += list(value)
+            elif kind == "linkedFramework":
+                self.link_flags += ["-framework", value]
+            elif kind == "linkedLibrary":
+                self.link_flags += [f"-l{value}"]
+
+    def build(self):
+        proc = self.tc.swift_build(self.root, self.scratch)
+        lines = [l for l in (proc.stdout + proc.stderr).splitlines() if not re.fullmatch(r"\[\d+ / \d+\].*", l)]
+        return proc.returncode == 0, "\n".join(lines).strip()
+
+    def objects(self):
+        return [o for o in sorted(self.products.glob("*.o")) if o.stem not in self.excluded]
+
+    def macro_plugins(self):
+        """-load-plugin-executable flags for the host executables SwiftPM built.
+
+        All executables are passed; swiftc only runs one when a macro from its module is used."""
+        flags = []
+        for folder in sorted(self.products.parent.glob("Debug-*")):
+            if folder == self.products or folder.name.endswith(("iphoneos", "iphonesimulator")):
+                continue
+            for exe in sorted(folder.iterdir()):
+                if exe.is_file() and os.access(exe, os.X_OK) and not exe.suffix:
+                    flags += ["-load-plugin-executable", f"{exe}#{exe.name}"]
+        return flags
+
+    def bundles(self):
+        return sorted(p for p in self.products.glob("*.bundle") if p.is_dir())
+
+
+def walk_files(base, skip=None):
+    for dirpath, dirs, files in os.walk(base):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith("."))
+        for f in sorted(files):
+            path = Path(dirpath) / f
+            if not f.startswith(".") and not (skip and skip(path)):
+                yield path
+
+
+def flatten_asset_catalog(catalog):
+    """Loose files for the image sets of an .xcassets folder (compiling Assets.car needs a Mac).
+
+    `Image("name", bundle: .module)` finds loose `name.png` / `name@2x.png` files. Colour sets
+    and other asset types have no loose-file equivalent and are skipped.
+    """
+    for imageset in sorted(catalog.rglob("*.imageset")):
+        try:
+            images = json.loads((imageset / "Contents.json").read_text()).get("images", [])
+        except (OSError, ValueError):
+            images = []
+        for image in images:
+            filename = image.get("filename")
+            if not filename or image.get("appearances") or not (imageset / filename).exists():
+                continue
+            scale = image.get("scale", "1x")
+            suffix = "" if scale == "1x" else f"@{scale}"
+            yield f"{imageset.stem}{suffix}{Path(filename).suffix}", imageset / filename
+
+
+# ------------------------------------------------------------------ builder
+
+class Builder:
+    def __init__(self, args, toolchain):
+        self.tc = toolchain
+        target = Path(args.path).resolve()
+        if not target.exists():
+            sys.exit(f"peek: {target} does not exist")
+        self.single = target if target.is_file() else None
+        self.root = target.parent if self.single else target
+        self.root_expr = args.root
+        self.prefer_app = getattr(args, "app", False)
+        self.wanted_target = getattr(args, "target", None)
+        self.ios_override = args.ios
+        self.swift_version = args.swift_version
+        self.extra = args.swiftc_flag or []
+        self.incremental = not getattr(args, "no_incremental", False)
+        key = hashlib.sha1(str(target).encode()).hexdigest()[:12]
+        self.out = STATE_DIR / "build" / key
+        self.scratch = STATE_DIR / "spm" / key  # kept between runs: dependency builds are slow
+        # Sources and objects are kept between runs too, so the first build after a restart is incremental.
+        for old in self.out.glob("*.dylib"):
+            old.unlink()
+        if not self.incremental:
+            shutil.rmtree(self.out / "obj", ignore_errors=True)
+        (self.out / "src").mkdir(parents=True, exist_ok=True)
+        self.name = target.stem if self.single else target.name
+        self.is_package = not self.single and (self.root / "Package.swift").exists()
+        self.package = None
+        self.package_error = None
+
+    @property
+    def ios(self):
+        if self.ios_override:
+            return self.ios_override
+        manifest = self.root / "Package.swift"
+        if self.is_package and manifest.exists():
+            m = re.search(r"\.iOS\(\s*(?:\.v(\d+)(?:_(\d+))?|\"([\d.]+)\")", manifest.read_text(errors="replace"))
+            if m:
+                return m.group(3) or f"{m.group(1)}.{m.group(2) or 0}"
+        return "17.0"
+
+    # -- inputs
+
+    def source_dir(self):
+        if self.package:
+            return self.package.target_dir
+        return self.root / "Sources" if (self.root / "Sources").is_dir() else self.root
+
+    def sources(self):
+        if self.single:
+            return [self.single]
+        return [p for p in walk_files(self.source_dir()) if p.suffix == ".swift" and p.name != "Package.swift"]
+
+    def resources(self):
+        """Returns (bundle name for Bundle.module or None, [(path inside the archive, file)])."""
+        files, name = [], None
+        if self.package:
+            name = self.package.bundle_name
+            compiled = False
+            for bundle in self.package.bundles():
+                for path in walk_files(bundle):
+                    files.append((f"{bundle.name}/{path.relative_to(bundle)}", path))
+                    compiled |= path.name == "Assets.car" and bundle.stem == name
+            catalogs = [] if compiled else sorted(self.package.target_dir.rglob("*.xcassets"))
+            if catalogs:
+                name = name or f"{self.package.name}_{self.package.target}"
+        elif not self.single:
+            name = "PeekResources"
+            base = self.source_dir()
+            for folder in sorted(p for p in base.rglob("Resources") if p.is_dir()):
+                for path in walk_files(folder, skip=lambda p: ".xcassets" in p.parts):
+                    files.append((f"{name}.bundle/{path.name}", path))
+            catalogs = sorted(base.rglob("*.xcassets"))
+        else:
+            catalogs = []
+        for catalog in catalogs:
+            for filename, path in flatten_asset_catalog(catalog):
+                files.append((f"{name}.bundle/{filename}", path))
+        unique = {}
+        for arcname, path in files:
+            unique.setdefault(arcname, path)
+        if not unique and not (self.package and self.package.bundle_name):
+            name = None
+        return name, sorted(unique.items())
+
+    @staticmethod
+    def _stamp(paths):
+        parts = []
+        for p in paths:
+            try:
+                st = p.stat()
+                parts.append((str(p), st.st_mtime_ns, st.st_size))
+            except OSError:
+                pass
+        return tuple(parts)
+
+    def fingerprint(self):
+        """Changes whenever a fast rebuild is needed."""
+        return self._stamp(self.sources()) + (self._stamp(p for _, p in self.resources()[1]) if not self.package else ())
+
+    def package_fingerprint(self):
+        """Changes whenever dependencies or resources must be rebuilt by SwiftPM (package mode only)."""
+        if not self.is_package:
+            return None
+        target_dir = self.package.target_dir if self.package else None
+        roots = [self.root] + [d for d in (self.package.local_deps if self.package else [])
+                               if self.root not in d.parents]
+
+        def previewed_source(path):
+            return path.suffix == ".swift" and target_dir is not None and target_dir in path.parents
+
+        return self._stamp(p for base in roots for p in walk_files(base, skip=previewed_source))
+
+    # -- building
+
+    def prepare_package(self):
+        """Resolves and builds the package's dependencies. Slow; runs when the manifest or a dependency changes."""
+        self.package_error = None
+        try:
+            self.package = Package(self.root, self.tc, self.wanted_target, self.scratch)
+        except (ValueError, OSError) as e:
+            self.package, self.package_error = None, f"Package.swift: {e}"
+            return False
+        ok, output = self.package.build()
+        if not ok:
+            # The previewed target itself may be what failed; the fast build reports that better.
+            self.package_error = output
+        return ok
+
+    def _common_flags(self):
+        cmd = ["-target", f"arm64-apple-ios{self.ios}", "-sdk", str(self.tc.sdk), "-resource-dir", str(self.tc.resources)]
+        if self.package:
+            cmd += ["-I", str(self.package.products), "-F", str(self.package.products / "PackageFrameworks")]
+        return cmd
+
+    def _link_flags(self):
+        cmd = ["-Xclang-linker", "-mlinker-version=1100"]
+        if self.tc.linker:
+            cmd.append(f"-ld-path={self.tc.linker}")
+        if self.tc.runtime:  # provides __isPlatformVersionAtLeast for `if #available`
+            cmd += ["-Xlinker", str(self.tc.runtime)]
+        return cmd + (self.package.link_flags if self.package else [])
+
+    @staticmethod
+    def _clean(output, replacements=()):
+        output = "\n".join(l for l in output.splitlines()
+                           if "does not support linking for platform" not in l
+                           and "auto-linked framework not found" not in l
+                           and "search path" not in l)
+        for old, new in replacements:
+            output = output.replace(old, new)
+        return output
+
+    def deps_library(self, sign_key):
+        """Links the package's dependencies into one library the phone keeps across reloads.
+
+        Its name holds a hash of the objects and of the signing identity, so the phone downloads
+        it again only when either changes. Returns (id, path) or None.
+        """
+        objects = self.package.objects() if self.package else []
+        if not objects:
+            return None
+        key = hashlib.sha1(repr((self._stamp(objects), sign_key, self.ios)).encode()).hexdigest()[:12]
+        folder = self.out / "deps"
+        path = folder / f"PeekDeps-{key}.dylib"
+        if not path.exists():
+            folder.mkdir(exist_ok=True)
+            for old in folder.glob("PeekDeps-*"):
+                old.unlink()
+            members = folder / "objects"
+            shutil.rmtree(members, ignore_errors=True)
+            members.mkdir()
+            inputs = [f for o in objects for f in unpack_object(o, members)]
+            cmd = [self.tc.swiftc, "-emit-library", *self._common_flags(), *self._link_flags(),
+                   "-Xlinker", "-install_name", "-Xlinker", f"@loader_path/{path.name}",
+                   *map(str, inputs), "-o", str(path)]
+            proc = subprocess.run(cmd, capture_output=True, text=True, cwd=self.out)
+            if proc.returncode != 0 or not path.exists():
+                raise RuntimeError("linking the dependencies failed:\n" + self._clean(proc.stdout + proc.stderr))
+        return key, path
+
+    def build(self, version, sign_key=""):
+        """Compile the sources into <out>/peek_<version>.dylib. Returns a result dict.
+
+        Compilation is incremental: rewritten copies of the sources are only rewritten when their
+        content changes, and the module name stays the same, so swiftc recompiles just the files
+        affected by an edit. Each version is then linked into a library of its own.
+        """
+        started = time.time()
+        if self.is_package and not self.package:
+            return {"ok": False, "diagnostics": self.package_error or "Package.swift could not be read"}
+        sources = self.sources()
+        if not sources:
+            return {"ok": False, "diagnostics": f"No .swift files found in {self.source_dir()}"}
+        srcdir, objdir = self.out / "src", self.out / "obj"
+        srcdir.mkdir(parents=True, exist_ok=True)
+        objdir.mkdir(exist_ok=True)
+        roots, inputs, structs, app = [], [], [], None
+        for path in sources:
+            shown = path.name if self.single else str(path.relative_to(self.root))
+            tag = hashlib.sha1(shown.encode()).hexdigest()[:8]
+            text = path.read_text(errors="replace")
+            new, found, app_struct = rewrite_source(text, tag)
+            roots += found
+            app = app or app_struct
+            structs += VIEW_STRUCT_RE.findall(code_mask(text))
+            copy = srcdir / f"{tag}_{path.name}"
+            write_if_changed(copy, new)
+            inputs.append((copy, shown))
+        if self.root_expr:
+            cases = [(self.root_expr, self.root_expr)]
+        elif roots and not self.prefer_app:
+            cases = [(f"{name}()", title or f"Preview {n + 1}") for n, (name, title) in enumerate(roots)]
+        elif app:
+            cases = [(f"{app}()", "App")]
+        else:
+            pick = "ContentView" if "ContentView" in structs else (structs[0] if structs else None)
+            if not pick:
+                return {"ok": False, "diagnostics":
+                        "No #Preview block, @main App or View struct found.\n"
+                        "Add `#Preview { MyView() }` or pass --root \"MyView()\"."}
+            cases = [(f"{pick}()", pick)]
+        body = "\n".join(
+            f"        case {i}: return UIHostingController(rootView: AnyView({expr}))"
+            for i, (expr, _) in enumerate(cases))
+        bundle_name, resources = self.resources()
+        support, entry = srcdir / "__PeekSupport.swift", srcdir / "__PeekEntry.swift"
+        write_if_changed(support, SUPPORT_SOURCE + (BUNDLE_TEMPLATE.replace("%NAME%", bundle_name) if bundle_name else ""))
+        write_if_changed(entry, ENTRY_TEMPLATE.replace("%CASES%", body))
+        files = [c for c, _ in inputs] + [support, entry]
+        for stale in srcdir.glob("*.swift"):
+            if stale not in files:
+                stale.unlink()
+
+        output_map = {"": {"swift-dependencies": str(objdir / "module.swiftdeps")}}
+        for f in files:
+            output_map[str(f)] = {"object": str(objdir / f"{f.stem}.o"),
+                                  "swift-dependencies": str(objdir / f"{f.stem}.swiftdeps")}
+        write_if_changed(self.out / "output-file-map.json", json.dumps(output_map, indent=1))
+        language = self.swift_version or (self.package.language_mode if self.package else None) or "5"
+        module = "PeekPreview" if self.incremental else f"PeekBuild{version}"
+        if not self.incremental:
+            for old in objdir.glob("*"):
+                old.unlink()
+        cmd = [self.tc.swiftc, "-c", "-parse-as-library", "-Onone", "-module-name", module,
+               "-swift-version", language, *self._common_flags(),
+               "-Xfrontend", "-enable-cross-import-overlays",
+               "-D", "DEBUG", "-D", "PEEK", "-suppress-warnings",
+               "-j", str(os.cpu_count() or 2), "-output-file-map", str(self.out / "output-file-map.json")]
+        if self.incremental:
+            cmd.append("-incremental")
+        if self.package:
+            cmd += ["-package-name", self.package.identity, *self.package.swift_flags, *self.package.macro_plugins()]
+        cmd += self.extra + [str(f) for f in files]
+        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=self.out)
+        shown = [(str(c), s) for c, s in inputs] + [(str(srcdir) + "/", "")]
+        output = self._clean(proc.stdout + proc.stderr, shown)
+        objects = [objdir / f"{f.stem}.o" for f in files]
+        deps = None
+        if proc.returncode == 0:
+            try:
+                deps = self.deps_library(sign_key)
+            except (RuntimeError, ValueError, OSError) as e:
+                output, proc = str(e), None
+        dylib = self.out / f"peek_{version}.dylib"
+        if proc is not None and proc.returncode == 0:
+            link = [self.tc.swiftc, "-emit-library", *self._common_flags(), *self._link_flags(),
+                    *map(str, objects), *([str(deps[1])] if deps else []), "-o", str(dylib)]
+            proc = subprocess.run(link, capture_output=True, text=True, cwd=self.out)
+            output = (output + "\n" + self._clean(proc.stdout + proc.stderr, shown)).strip()
+        elapsed = time.time() - started
+        if proc is None or proc.returncode != 0 or not dylib.exists():
+            if self.package_error and "error:" not in output:
+                output = self.package_error + "\n\n" + output
+            return {"ok": False, "diagnostics": output.strip() or "swiftc failed", "seconds": elapsed}
+        for old in self.out.glob("peek_*.dylib"):
+            if not old.name.startswith(f"peek_{version}.") and old != dylib and old.stat().st_mtime < time.time() - 600:
+                old.unlink()
+        return {"ok": True, "dylib": dylib, "roots": [title for _, title in cases], "seconds": elapsed,
+                "resources": resources, "deps": deps}
+
+
+def unpack_object(path, folder):
+    """The object files in path: SwiftBuild's `<Module>.o` is sometimes an `ar` archive.
+
+    Linked into a library of their own, archive members are only pulled in when something
+    refers to them, which nothing does, so they are extracted and linked as plain objects.
+    """
+    data = path.read_bytes()
+    if not data.startswith(b"!<arch>\n"):
+        return [path]
+    found, offset = [], 8
+    while offset + 60 <= len(data):
+        header = data[offset:offset + 60]
+        name, size = header[:16].decode(errors="replace").strip(), int(header[48:58].decode().strip())
+        body = data[offset + 60:offset + 60 + size]
+        if name.startswith("#1/"):  # BSD long name: stored at the start of the body
+            length = int(name[3:])
+            name, body = body[:length].rstrip(b"\0").decode(errors="replace"), body[length:]
+        if not name.startswith("__.SYMDEF") and name.endswith(".o"):
+            out = folder / f"{path.stem}-{len(found)}-{Path(name).name}"
+            out.write_bytes(body)
+            found.append(out)
+        offset += 60 + size + (size & 1)
+    return found
+
+
+def write_if_changed(path, text):
+    """Writes text to path unless it already holds it, so unchanged files keep their timestamps."""
+    try:
+        if path.read_text() == text:
+            return False
+    except OSError:
+        pass
+    path.write_text(text)
+    return True
+
+
+def pack_resources(files):
+    """Archive for the phone: "PEEKRES1", then per file u16 path length, path, u32 size, bytes."""
+    out = bytearray(b"PEEKRES1")
+    for arcname, path in files:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        name = arcname.encode()
+        out += struct.pack(">H", len(name)) + name + struct.pack(">I", len(data)) + data
+    return bytes(out)
+
+
+# ------------------------------------------------------------------ signing
+
+APPLE_CERT_URLS = {
+    "root": "https://www.apple.com/appleca/AppleIncRootCertificate.cer",
+    "G3": "https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer",
+    "G6": "https://www.apple.com/certificateauthority/AppleWWDRCAG6.cer",
+    "G2": "https://www.apple.com/certificateauthority/AppleWWDRCAG2.cer",
+    "G4": "https://www.apple.com/certificateauthority/AppleWWDRCAG4.cer",
+    "G5": "https://www.apple.com/certificateauthority/AppleWWDRCAG5.cer",
+}
+
+
+class Signer:
+    """Signs dylibs with the developer certificate the phone's sideloading store uses.
+
+    iOS only loads code signed by a certificate from a provisioning profile on the
+    device, with the same Team ID as the host app, so the dylib must be signed
+    with that very certificate. The host app imports it from SideStore/AltStore
+    and uploads it (encrypted with the pairing key) once.
+    """
+
+    def __init__(self, toolchain):
+        self.tc = toolchain
+        self.p12 = STATE_DIR / "cert.p12"
+        self.info_path = STATE_DIR / "cert.json"
+        self.info = json.loads(self.info_path.read_text()) if self.info_path.exists() and self.p12.exists() else None
+        # Bundle identifier of the app that loads the builds, as reported by the phone. A free
+        # developer account's profile names one explicit app ID, and iOS matches code without
+        # entitlements against it by signing identifier, so builds are signed under that name.
+        self.identifier_path = STATE_DIR / "identifier"
+        self.identifier = self.identifier_path.read_text().strip() if self.identifier_path.exists() else None
+
+    @property
+    def ready(self):
+        return self.info is not None
+
+    def stamp(self):
+        try:
+            return self.info_path.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def key(self):
+        """Changes whenever builds have to be signed differently."""
+        return f"{self.identifier}|{self.stamp()}"
+
+    def reload(self):
+        self.info = json.loads(self.info_path.read_text()) if self.info_path.exists() and self.p12.exists() else None
+
+    def _openssl(self, *args, data=None, env=None):
+        return subprocess.run([self.tc.openssl, *args], input=data, capture_output=True,
+                              env={**os.environ, **(env or {})})
+
+    def _extract(self, p12_path, password):
+        """Returns (key_pem, cert_pem) from a PKCS#12: the private key and the certificate that goes with it."""
+        secret = {"PEEK_P12_PASSWORD": password}  # not in argv, where `ps` would show it
+        for legacy in ([], ["-legacy"]):
+            base = ["pkcs12", "-in", str(p12_path), "-passin", "env:PEEK_P12_PASSWORD", *legacy]
+            key = self._openssl(*base, "-nocerts", "-nodes", env=secret)
+            certs = self._openssl(*base, "-nokeys", env=secret)
+            if key.returncode != 0 or certs.returncode != 0 or b"PRIVATE KEY" not in key.stdout:
+                continue
+            found = re.findall(rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----\n?", certs.stdout, re.S)
+            if not found:
+                raise ValueError("the .p12 file contains a private key but no certificate")
+            # Stores do not always tag which certificate belongs to the key, so match by public key.
+            public = self._openssl("pkey", "-pubout", data=key.stdout).stdout
+            for cert in found:
+                if public and self._openssl("x509", "-noout", "-pubkey", data=cert).stdout == public:
+                    return key.stdout, cert
+            return key.stdout, found[0]
+        raise ValueError("could not read the certificate (wrong password or unsupported format)")
+
+    def _apple_cert(self, name):
+        cache = STATE_DIR / f"apple-{name}.pem"
+        if not cache.exists():
+            der = urllib.request.urlopen(APPLE_CERT_URLS[name], timeout=20).read()
+            pem = self._openssl("x509", "-inform", "DER", "-outform", "PEM", data=der)
+            if pem.returncode != 0:
+                raise ValueError(f"could not fetch Apple {name} certificate")
+            cache.write_bytes(pem.stdout)
+        return cache.read_bytes()
+
+    def install(self, p12_bytes, password):
+        private_dir()
+        raw = STATE_DIR / "cert-upload.p12"
+        write_private(raw, p12_bytes)
+        try:
+            key, cert = self._extract(raw, password)
+        finally:
+            raw.unlink(missing_ok=True)
+        text = self._openssl("x509", "-noout", "-subject", "-issuer", "-enddate", "-nameopt", "RFC2253", data=cert).stdout.decode(errors="replace")
+
+        def field(pattern, source=text):
+            m = re.search(pattern, source)
+            return m.group(1).strip() if m else None
+
+        subject = field(r"subject=\s*(.*)") or ""
+        issuer = field(r"issuer=\s*(.*)") or ""
+        team = re.search(r"OU=([A-Z0-9]{10})", subject)
+        common = re.search(r"CN=((?:\\.|[^,])*)", subject)
+        generation = re.search(r"OU=(G\d)", issuer)
+        chain = b""
+        try:
+            chain = self._apple_cert(generation.group(1) if generation else "G3") + self._apple_cert("root")
+        except Exception as e:  # signing still works without the chain on some iOS versions
+            log(f"warning: could not fetch Apple intermediate certificates ({e})", "yellow")
+        work = STATE_DIR / "cert-work"
+        shutil.rmtree(work, ignore_errors=True)
+        work.mkdir(mode=0o700)
+        try:
+            write_private(work / "key.pem", key)
+            write_private(work / "cert.pem", cert)
+            write_private(work / "chain.pem", chain)
+            if self.p12.exists():
+                os.chmod(self.p12, 0o600)
+            else:
+                write_private(self.p12, b"")
+            cmd = ["pkcs12", "-export", "-inkey", str(work / "key.pem"), "-in", str(work / "cert.pem"),
+                   "-out", str(self.p12), "-passout", "pass:"]
+            if chain:
+                cmd += ["-certfile", str(work / "chain.pem")]
+            done = self._openssl(*cmd)
+            if done.returncode != 0:
+                raise ValueError("could not repack certificate: " + done.stderr.decode(errors="replace")[-200:])
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        os.chmod(self.p12, 0o600)
+        self.info = {
+            "team": team.group(1) if team else None,
+            "name": common.group(1).replace("\\", "") if common else (subject or "certificate"),
+            "expires": field(r"notAfter=(.*)") or "unknown",
+        }
+        self.info_path.write_text(json.dumps(self.info))
+        return self.info
+
+    def adopt(self, identifier):
+        """Records the host app's bundle identifier; true when it changed."""
+        if not identifier or not re.fullmatch(r"[A-Za-z0-9.\-]+", identifier) or identifier == self.identifier:
+            return False
+        self.identifier = identifier
+        private_dir()
+        self.identifier_path.write_text(identifier)
+        return True
+
+    def sign(self, dylib):
+        """Signs a copy of dylib and returns its path."""
+        signed = dylib.with_name(f"{dylib.stem}.signed.dylib")
+        shutil.copyfile(dylib, signed)
+        proc = subprocess.run([self.tc.ldid, f"-K{self.p12}", "-U",
+                               *([f"-I{self.identifier}"] if self.identifier else []), "-S", str(signed)],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError("ldid failed: " + (proc.stderr or proc.stdout).strip())
+        return signed
+
+    def fingerprint(self):
+        """SHA-256 of the signing certificate (DER), as the phone computes it from its provisioning profile."""
+        pem = self._openssl("pkcs12", "-in", str(self.p12), "-passin", "pass:", "-clcerts", "-nokeys").stdout
+        der = self._openssl("x509", "-outform", "DER", data=pem).stdout
+        return hashlib.sha256(der).hexdigest() if der else None
+
+
+# ------------------------------------------------------------------- crypto
+#
+# Keys are derived from the pairing token. Responses and sensitive request bodies are sealed
+# with AES-256-CTR + HMAC-SHA256 (encrypt-then-MAC). AES comes from the openssl CLI, so only
+# the standard library is needed; the phone uses CommonCrypto.
+
+OPENSSL = shutil.which("openssl") or "openssl"
+SEALED_TYPE = "application/x-peek-sealed"
+
+
+def derive(token, label):
+    return hmac.new(bytes.fromhex(token), label.encode(), hashlib.sha256).digest()
+
+
+def _aes_ctr(key, nonce, data):
+    if not data:
+        return b""
+    proc = subprocess.run([OPENSSL, "enc", "-aes-256-ctr", "-nosalt", "-K", key.hex(), "-iv", nonce.hex()],
+                          input=data, capture_output=True)
+    if proc.returncode != 0 or len(proc.stdout) != len(data):
+        raise RuntimeError("openssl enc failed: " + proc.stderr.decode(errors="replace").strip())
+    return proc.stdout
+
+
+def seal(token, data):
+    """nonce(16) | AES-256-CTR(data) | HMAC-SHA256(nonce | ciphertext)."""
+    nonce = os.urandom(16)
+    body = _aes_ctr(derive(token, "peek-enc"), nonce, data)
+    return nonce + body + hmac.new(derive(token, "peek-mac"), nonce + body, hashlib.sha256).digest()
+
+
+def unseal(token, blob):
+    if len(blob) < 48:
+        raise ValueError("short message")
+    nonce, body, tag = blob[:16], blob[16:-32], blob[-32:]
+    if not hmac.compare_digest(tag, hmac.new(derive(token, "peek-mac"), nonce + body, hashlib.sha256).digest()):
+        raise ValueError("bad authentication tag")
+    return _aes_ctr(derive(token, "peek-enc"), nonce, body)
+
+
+def auth_message(method, path, stamp, body, bundle, device):
+    """What `X-Peek-Auth` signs: the request line, the time, the body and the headers the server acts on."""
+    return f"{method}\n{path}\n{stamp}\n{hashlib.sha256(body).hexdigest()}\n{bundle}\n{device}".encode()
+
+
+def auth_header(token, method, path, body=b"", bundle="", device=""):
+    stamp = int(time.time())
+    mac = hmac.new(derive(token, "peek-auth"), auth_message(method, path, stamp, body, bundle, device), hashlib.sha256)
+    return f"{stamp}:{mac.hexdigest()}"
+
+
+# ----------------------------------------------------------------- QR code
+
+# Per version 1-10 at error correction level L: (EC codewords per block, [data codewords per block]).
+QR_BLOCKS = {1: (7, [19]), 2: (10, [34]), 3: (15, [55]), 4: (20, [80]), 5: (26, [108]),
+             6: (18, [68, 68]), 7: (20, [78, 78]), 8: (24, [97, 97]), 9: (30, [116, 116]),
+             10: (18, [68, 68, 69, 69])}
+QR_ALIGNMENT = {1: [], 2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30], 6: [6, 34],
+                7: [6, 22, 38], 8: [6, 24, 42], 9: [6, 26, 46], 10: [6, 28, 50]}
+
+
+def _rs_remainder(data, degree):
+    """Reed-Solomon error correction codewords over GF(2^8) mod 0x11D."""
+    def mul(x, y):
+        z = 0
+        for i in range(7, -1, -1):
+            z = (z << 1) ^ ((z >> 7) * 0x11D)
+            z ^= ((y >> i) & 1) * x
+        return z
+    generator, root = [0] * (degree - 1) + [1], 1
+    for _ in range(degree):
+        for j in range(degree):
+            generator[j] = mul(generator[j], root)
+            if j + 1 < degree:
+                generator[j] ^= generator[j + 1]
+        root = mul(root, 2)
+    result = [0] * degree
+    for byte in data:
+        factor = byte ^ result.pop(0)
+        result.append(0)
+        result = [r ^ mul(g, factor) for r, g in zip(result, generator)]
+    return result
+
+
+def qr_matrix(text):
+    """Encodes text as a QR code (byte mode, level L). Returns rows of booleans, True = dark."""
+    payload = text.encode()
+    for version in range(1, 11):
+        ec_len, blocks = QR_BLOCKS[version]
+        capacity = sum(blocks)
+        count_bits = 8 if version < 10 else 16
+        if len(payload) * 8 + 4 + count_bits <= capacity * 8:
+            break
+    else:
+        raise ValueError("text too long for a QR code")
+    bits = [0, 1, 0, 0] + [(len(payload) >> i) & 1 for i in range(count_bits - 1, -1, -1)]
+    for byte in payload:
+        bits += [(byte >> i) & 1 for i in range(7, -1, -1)]
+    bits += [0] * min(4, capacity * 8 - len(bits))
+    bits += [0] * (-len(bits) % 8)
+    data = [int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8)]
+    data += [0xEC, 0x11] * capacity
+    data = data[:capacity]
+
+    chunks, ec_chunks, offset = [], [], 0
+    for length in blocks:
+        chunk = data[offset:offset + length]
+        offset += length
+        chunks.append(chunk)
+        ec_chunks.append(_rs_remainder(chunk, ec_len))
+    stream = [c[i] for i in range(max(blocks)) for c in chunks if i < len(c)]
+    stream += [c[i] for i in range(ec_len) for c in ec_chunks]
+
+    size = 17 + 4 * version
+    dark = [[False] * size for _ in range(size)]
+    fixed = [[False] * size for _ in range(size)]
+
+    def put(x, y, value):
+        if 0 <= x < size and 0 <= y < size:
+            dark[y][x], fixed[y][x] = bool(value), True
+
+    for i in range(size):  # timing patterns
+        put(6, i, i % 2 == 0)
+        put(i, 6, i % 2 == 0)
+    for cx, cy in ((3, 3), (size - 4, 3), (3, size - 4)):  # finders with separators
+        for dy in range(-4, 5):
+            for dx in range(-4, 5):
+                put(cx + dx, cy + dy, max(abs(dx), abs(dy)) not in (2, 4))
+    centers = QR_ALIGNMENT[version]
+    for cy in centers:
+        for cx in centers:
+            if (cx, cy) in ((6, 6), (6, centers[-1]), (centers[-1], 6)):
+                continue
+            for dy in range(-2, 3):
+                for dx in range(-2, 3):
+                    put(cx + dx, cy + dy, max(abs(dx), abs(dy)) != 1)
+
+    def put_format(mask):
+        value = (1 << 3) | mask  # level L
+        rem = value
+        for _ in range(10):
+            rem = (rem << 1) ^ ((rem >> 9) * 0x537)
+        code = ((value << 10) | rem) ^ 0x5412
+        bit = lambda i: (code >> i) & 1
+        for i in range(6):
+            put(8, i, bit(i))
+        put(8, 7, bit(6))
+        put(8, 8, bit(7))
+        put(7, 8, bit(8))
+        for i in range(9, 15):
+            put(14 - i, 8, bit(i))
+        for i in range(8):
+            put(size - 1 - i, 8, bit(i))
+        for i in range(8, 15):
+            put(8, size - 15 + i, bit(i))
+        put(8, size - 8, True)
+
+    put_format(0)  # reserve the area
+    if version >= 7:
+        rem = version
+        for _ in range(12):
+            rem = (rem << 1) ^ ((rem >> 11) * 0x1F25)
+        code = (version << 12) | rem
+        for i in range(18):
+            a, b = size - 11 + i % 3, i // 3
+            put(a, b, (code >> i) & 1)
+            put(b, a, (code >> i) & 1)
+
+    index = 0
+    for right in range(size - 1, 0, -2):  # zigzag data placement
+        if right <= 6:
+            right -= 1
+        for vertical in range(size):
+            for j in range(2):
+                x = right - j
+                y = size - 1 - vertical if (right + 1) & 2 == 0 else vertical
+                if not fixed[y][x] and index < len(stream) * 8:
+                    dark[y][x] = bool((stream[index >> 3] >> (7 - (index & 7))) & 1)
+                    index += 1
+
+    masks = [lambda x, y: (x + y) % 2, lambda x, y: y % 2, lambda x, y: x % 3,
+             lambda x, y: (x + y) % 3, lambda x, y: (x // 3 + y // 2) % 2,
+             lambda x, y: x * y % 2 + x * y % 3, lambda x, y: (x * y % 2 + x * y % 3) % 2,
+             lambda x, y: ((x + y) % 2 + x * y % 3) % 2]
+
+    def penalty(grid):
+        score = 0
+        for lines in (grid, list(zip(*grid))):
+            for line in lines:
+                run = 1
+                for i in range(1, size):
+                    if line[i] == line[i - 1]:
+                        run += 1
+                    else:
+                        score += run - 2 if run >= 5 else 0
+                        run = 1
+                score += run - 2 if run >= 5 else 0
+                text = "".join("1" if v else "0" for v in line)
+                score += 40 * (text.count("10111010000") + text.count("00001011101"))
+        for y in range(size - 1):
+            for x in range(size - 1):
+                if grid[y][x] == grid[y][x + 1] == grid[y + 1][x] == grid[y + 1][x + 1]:
+                    score += 3
+        ratio = sum(map(sum, grid)) * 20 // (size * size)
+        return score + 10 * abs(ratio - 10)
+
+    best = None
+    for number, mask in enumerate(masks):
+        grid = [[dark[y][x] ^ (not fixed[y][x] and mask(x, y) == 0) for x in range(size)] for y in range(size)]
+        saved = dark
+        dark = grid
+        put_format(number)
+        dark = saved
+        score = penalty(grid)
+        if best is None or score < best[0]:
+            best = (score, grid)
+    return best[1]
+
+
+def qr_text(text, margin=2):
+    """Renders a QR code with half-block characters, black on white regardless of terminal theme."""
+    grid = qr_matrix(text)
+    size = len(grid) + 2 * margin
+    cell = lambda x, y: 0 <= y - margin < len(grid) and 0 <= x - margin < len(grid) and grid[y - margin][x - margin]
+    lines = []
+    for y in range(0, size, 2):
+        row = ""
+        for x in range(size):
+            top, bottom = cell(x, y), cell(x, y + 1) if y + 1 < size else False
+            row += "\033[%d;%dm▀" % (30 if top else 97, 40 if bottom else 107)
+        lines.append("  " + row + "\033[0m")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------- mDNS
+
+class Advertiser:
+    """Minimal Bonjour responder so a paired phone finds the server again on any Wi-Fi address.
+
+    Publishes `_peek._tcp` with a TXT record holding the server's addresses and an id derived
+    from the pairing key (so the phone picks its own server). Nothing secret is advertised.
+    """
+
+    GROUP, PORT, SERVICE = "224.0.0.251", 5353, ["_peek", "_tcp", "local"]
+
+    def __init__(self, name, port, addresses, txt):
+        label = re.sub(r"[^A-Za-z0-9-]", "-", name)[:40] or "peek"
+        self.instance = [f"{label}-{txt['id']}"] + self.SERVICE
+        self.host = [f"peek-{txt['id']}", "local"]
+        self.port, self.txt = port, txt
+        self.sockets = []
+        for address in addresses:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if hasattr(socket, "SO_REUSEPORT"):
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                sock.bind(("", self.PORT))
+                member = socket.inet_aton(self.GROUP) + socket.inet_aton(address)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, member)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(address))
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+                self.sockets.append((sock, address))
+            except OSError:
+                continue
+        for sock, address in self.sockets:
+            threading.Thread(target=self._serve, args=(sock, address), daemon=True).start()
+
+    @staticmethod
+    def _name(labels):
+        return b"".join(bytes([len(l.encode())]) + l.encode() for l in labels) + b"\0"
+
+    def _record(self, name, rtype, data, ttl, unique=True):
+        rclass = 0x8001 if unique else 0x0001  # cache-flush bit for records we own
+        return self._name(name) + struct.pack(">HHIH", rtype, rclass, ttl, len(data)) + data
+
+    def _response(self, address, ttl=120):
+        txt = b"".join(bytes([len(e)]) + e for e in (f"{k}={v}".encode() for k, v in self.txt.items()))
+        records = [
+            self._record(self.SERVICE, 12, self._name(self.instance), ttl, unique=False),
+            self._record(["_services", "_dns-sd", "_udp", "local"], 12, self._name(self.SERVICE), ttl, unique=False),
+            self._record(self.instance, 33, struct.pack(">HHH", 0, 0, self.port) + self._name(self.host), ttl),
+            self._record(self.instance, 16, txt, ttl),
+            self._record(self.host, 1, socket.inet_aton(address), ttl),
+        ]
+        return struct.pack(">HHHHHH", 0, 0x8400, 0, len(records), 0, 0) + b"".join(records)
+
+    @staticmethod
+    def _questions(packet):
+        """Lower-cased names asked about in an mDNS query packet."""
+        flags, count = struct.unpack(">HH", packet[2:6])
+        if flags & 0x8000:
+            return []
+        names, offset = [], 12
+        for _ in range(count):
+            labels, jumps, cursor, end = [], 0, offset, None
+            while cursor < len(packet):
+                length = packet[cursor]
+                if length == 0:
+                    cursor += 1
+                    break
+                if length & 0xC0 == 0xC0:
+                    if end is None:
+                        end = cursor + 2
+                    cursor = ((length & 0x3F) << 8) | packet[cursor + 1]
+                    jumps += 1
+                    if jumps > 8:
+                        return names
+                    continue
+                labels.append(packet[cursor + 1:cursor + 1 + length].decode(errors="replace").lower())
+                cursor += 1 + length
+            offset = (end if end is not None else cursor) + 4
+            names.append(".".join(labels))
+        return names
+
+    def _serve(self, sock, address):
+        mine = {".".join(n).lower() for n in (self.SERVICE, self.instance, self.host,
+                                               ["_services", "_dns-sd", "_udp", "local"])}
+        self._send(sock, address)
+        last = time.time()
+        while True:
+            try:
+                packet, _ = sock.recvfrom(9000)
+                if time.time() - last > 0.5 and mine & set(self._questions(packet)):
+                    self._send(sock, address)
+                    last = time.time()
+            except OSError:
+                return
+            except (struct.error, IndexError):
+                continue
+
+    def _send(self, sock, address, ttl=120):
+        try:
+            sock.sendto(self._response(address, ttl), (self.GROUP, self.PORT))
+        except OSError:
+            pass
+
+    def close(self):
+        for sock, address in self.sockets:
+            self._send(sock, address, ttl=0)  # goodbye
+            sock.close()
+
+
+# ------------------------------------------------------------------- server
+
+class Hub:
+    """Shared state between the build loop and the HTTP handlers."""
+
+    def __init__(self, builder, signer, token):
+        self.builder, self.signer, self.token = builder, signer, token
+        self.cond = threading.Condition()
+        self.version = 0
+        self.state = {"status": "building"}
+        self.dylib = None
+        self.deps = None  # (id, signed path) of the dependency library
+        self.built = False  # the last build compiled (it may still wait for a certificate)
+        self.devices = {}
+        self.lock = threading.Lock()  # serialises builds and certificate installs
+        self.archives = {}  # resource archive id -> bytes
+        self.shot = 0  # screenshot requests so far; the phone answers each one
+        self.shots = {}  # request number -> PNG bytes
+
+    def snapshot(self):
+        cert = self.signer.info or {}
+        return {"version": self.version, "project": self.builder.name, "peek": VERSION, "shot": self.shot,
+                "hasCert": self.signer.ready, "team": cert.get("team"), **self.state}
+
+    def publish(self, state, dylib=None, deps=None):
+        with self.cond:
+            self.version += 1
+            self.state, self.dylib, self.deps = state, dylib, deps
+            self.cond.notify_all()
+
+    def rebuild(self):
+        with self.lock:
+            self._rebuild()
+
+    def refresh_package(self):
+        with self.lock:
+            log("building package dependencies…", "dim")
+            started = time.time()
+            ok = self.builder.prepare_package()
+            if ok:
+                log(f"dependencies ready ({time.time() - started:.1f}s)", "dim")
+            elif not self.builder.package:
+                log(self.builder.package_error, "red")
+
+    def _rebuild(self):
+        version = self.version + 1
+        try:
+            result = self.builder.build(version, sign_key=self.signer.key())
+        except Exception as e:
+            result = {"ok": False, "diagnostics": f"peek: build crashed: {type(e).__name__}: {e}"}
+        self.built = result["ok"]
+        if not result["ok"]:
+            log(f"build failed ({result.get('seconds', 0):.1f}s)", "red")
+            print(result["diagnostics"], flush=True)
+            self.publish({"status": "error", "diagnostics": result["diagnostics"]})
+            return
+        self.finish(result)
+
+    def finish(self, result):
+        """Sign (if possible) and publish a successful build."""
+        state = {"roots": result["roots"], "seconds": round(result["seconds"], 2)}
+        if result.get("resources"):
+            stamp = Builder._stamp(p for _, p in result["resources"]) + tuple(a for a, _ in result["resources"])
+            rid = hashlib.sha1(repr(stamp).encode()).hexdigest()[:16]
+            if rid not in self.archives:
+                self.archives = {rid: pack_resources(result["resources"])}
+            state["resources"] = {"id": rid, "size": len(self.archives[rid])}
+        if not self.signer.ready:
+            log(f"built in {result['seconds']:.1f}s — waiting for a signing certificate from the phone", "yellow")
+            self.publish({"status": "needs-cert", **state})
+            return
+        try:
+            signed = self.signer.sign(result["dylib"])
+            deps = None
+            if result.get("deps"):
+                key, path = result["deps"]
+                deps_signed = path.with_name(f"{path.stem}.signed.dylib")
+                if not deps_signed.exists():
+                    self.signer.sign(path)
+                deps = (key, deps_signed)
+                state["deps"] = {"id": key, "size": deps_signed.stat().st_size}
+        except Exception as e:
+            log(str(e), "red")
+            self.publish({"status": "error", "diagnostics": f"Signing failed: {e}"})
+            return
+        log(f"built + signed in {result['seconds']:.1f}s → v{self.version + 1} ({', '.join(result['roots'])})", "green")
+        self.publish({"status": "ready", "size": signed.stat().st_size, **state}, signed, deps)
+
+    def resign(self):
+        """Builds again (only linking, when nothing else changed) after the signing identity changed.
+
+        The dependency library's name holds the identity, so it is linked again as well."""
+        if self.built or self.state.get("status") == "needs-cert":
+            self._rebuild()
+
+    def adopt(self, identifier):
+        """Signs under the bundle identifier of the app that asks for builds (see Signer)."""
+        if not self.signer.adopt(identifier):
+            return
+        log(f"signing builds as {identifier}", "dim")
+        with self.lock:
+            if self.signer.ready:
+                self.resign()
+
+    def request_shot(self, timeout=20):
+        """Asks the phone for a screenshot of the preview; returns the PNG or None."""
+        with self.cond:
+            self.shot += 1
+            number = self.shot
+            self.cond.notify_all()
+            self.cond.wait_for(lambda: number in self.shots, timeout=timeout)
+            return self.shots.pop(number, None)
+
+    def deliver_shot(self, number, png):
+        with self.cond:
+            self.shots[number] = png
+            for old in [n for n in self.shots if n < number - 5]:
+                del self.shots[old]
+            self.cond.notify_all()
+
+    def diagnose(self, report):
+        """Explains the phone's code-signing situation next to the certificate we sign with."""
+        ours = self.signer.fingerprint() if self.signer.ready else None
+        team = (self.signer.info or {}).get("team")
+        log(f"[phone] signed by team {report.get('team')} · executable {report.get('executable')}"
+            + (f" · bundle {report['bundle']}" if report.get("bundle") else "")
+            + (f" · clock {report['time']}" if report.get("time") else ""), "dim")
+        for profile in report.get("profiles", []):
+            match = "contains our certificate" if ours in profile.get("certificates", []) else "does NOT contain our certificate"
+            log(f"[phone] profile {profile.get('name')!r} team {profile.get('team')} expires {profile.get('expires')}: "
+                f"{len(profile.get('certificates', []))} certificate(s), {match}",
+                "dim" if "NOT" not in match else "red")
+        if not report.get("profiles"):
+            log("[phone] no provisioning profile found next to the executable", "yellow")
+        if team and report.get("team") and team != report.get("team"):
+            log(f"the phone app is signed by team {report.get('team')} but our certificate is team {team}: "
+                "builds cannot load until the matching certificate is imported", "red")
+
+
+def make_handler(hub):
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = f"peek/{VERSION}"
+        sys_version = ""
+
+        def log_message(self, *args):
+            pass
+
+        def reply(self, code, body=b"", ctype="application/json"):
+            if isinstance(body, (dict, list)):
+                body = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def sealed(self, body):
+            """A successful reply, encrypted and authenticated with the pairing key."""
+            if isinstance(body, (dict, list)):
+                body = json.dumps(body).encode()
+            self.reply(200, seal(hub.token, body), SEALED_TYPE)
+
+        def authed(self, body=b""):
+            """Requests carry `X-Peek-Auth: <unix time>:<hex HMAC>` over auth_message()."""
+            try:
+                stamp, mac = self.headers.get("X-Peek-Auth", "").split(":")
+                if abs(time.time() - int(stamp)) > AUTH_WINDOW:
+                    return False
+                message = auth_message(self.command, self.path, stamp, body,
+                                       self.headers.get("X-Peek-Bundle", ""), self.headers.get("X-Peek-Device", ""))
+                good = hmac.new(derive(hub.token, "peek-auth"), message, hashlib.sha256).hexdigest()
+                return hmac.compare_digest(mac, good)
+            except ValueError:
+                return False
+
+        def seen(self):
+            name = printable(urllib.parse.unquote(self.headers.get("X-Peek-Device", "device")))[:64]
+            if name == "peek-cli":
+                return
+            if name not in hub.devices:
+                log(f"connected: {name} ({self.client_address[0]})", "green")
+            hub.devices[name] = time.time()
+            hub.adopt(self.headers.get("X-Peek-Bundle"))
+
+        def do_GET(self):
+            url = urllib.parse.urlparse(self.path)
+            query = urllib.parse.parse_qs(url.query)
+            if url.path == "/":
+                return self.reply(200, b"peek dev server. Open the pairing link in the Peek app.\n", "text/plain")
+            if not self.authed():
+                return self.reply(401, {"error": "unauthorized"})
+            self.seen()
+            if url.path == "/v1/state":
+                after = int(query.get("after", ["-1"])[0])
+                shot = int(query.get("shot", [str(hub.shot)])[0])
+                wait = min(float(query.get("wait", ["0"])[0]), 50)
+                with hub.cond:
+                    hub.cond.wait_for(lambda: hub.version != after or hub.shot != shot, timeout=wait)
+                    state = hub.snapshot()
+                return self.sealed(state)  # reply outside the lock
+            m = re.fullmatch(r"/v1/dylib/(\d+)(?:/\d+)?", url.path)
+            if m:
+                with hub.cond:
+                    current, dylib = hub.version, hub.dylib
+                try:
+                    if int(m.group(1)) != current or not dylib:
+                        raise FileNotFoundError
+                    data = dylib.read_bytes()
+                except OSError:  # superseded by a newer build
+                    return self.reply(404, {"error": "stale version"})
+                return self.sealed(data)
+            m = re.fullmatch(r"/v1/deps/(\w+)", url.path)
+            if m:
+                deps = hub.deps
+                try:
+                    if not deps or deps[0] != m.group(1):
+                        raise FileNotFoundError
+                    data = deps[1].read_bytes()
+                except OSError:
+                    return self.reply(404, {"error": "stale dependencies"})
+                return self.sealed(data)
+            m = re.fullmatch(r"/v1/resources/(\w+)", url.path)
+            if m:
+                archive = hub.archives.get(m.group(1))
+                if archive is None:
+                    return self.reply(404, {"error": "stale resources"})
+                return self.sealed(archive)
+            self.reply(404, {"error": "not found"})
+
+        def do_POST(self):
+            url = urllib.parse.urlparse(self.path)
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = -1
+            if length < 0:
+                self.close_connection = True
+                return self.reply(400, {"error": "bad Content-Length"})
+            if length > (64 << 20 if url.path == "/v1/shot" else 4 << 20):
+                self.close_connection = True
+                return self.reply(413, {"error": "too large"})
+            body = self.rfile.read(length)
+            if not self.authed(body):
+                return self.reply(401, {"error": "unauthorized"})
+            self.seen()
+            if url.path == "/v1/log":
+                try:
+                    entry = json.loads(body)
+                    level = entry.get("level", "info")
+                    if entry.get("output"):  # print() and stderr of the previewed code
+                        for line in str(entry["output"]).rstrip("\n").split("\n"):
+                            log(f"│ {printable(line)}", "dim" if level != "crash" else "red")
+                    elif entry.get("message"):
+                        log(f"[phone] {printable(entry['message'])}", {"error": "red", "warn": "yellow"}.get(level, "dim"))
+                    if isinstance(entry.get("diagnostics"), dict):
+                        hub.diagnose(entry["diagnostics"])
+                except (ValueError, OSError, AttributeError):
+                    pass
+                return self.sealed({})
+            if url.path == "/v1/shot":
+                number = int(urllib.parse.parse_qs(url.query).get("n", ["0"])[0])
+                hub.deliver_shot(number, unseal(hub.token, body))
+                return self.sealed({})
+            if url.path == "/v1/shot-request":
+                png = hub.request_shot()
+                if png is None:
+                    return self.reply(504, {"error": "no phone answered (is Peek open and showing a preview?)"})
+                return self.sealed(png)
+            if url.path == "/v1/cert":
+                with hub.lock:
+                    try:
+                        payload = json.loads(unseal(hub.token, body))
+                        info = hub.signer.install(base64.b64decode(payload["p12"]), payload.get("password", ""))
+                    except Exception as e:
+                        log(f"certificate rejected: {e}", "red")
+                        return self.reply(400, {"error": str(e)})
+                    log(f"certificate installed: {info['name']} (team {info['team']}, expires {info['expires']})", "green")
+                    hub.resign()
+                return self.sealed(info)
+            self.reply(404, {"error": "not found"})
+
+    return Handler
+
+
+def local_addresses():
+    """IPv4 addresses the phone might reach: LAN first, then Tailscale (100.64/10)."""
+    found = []
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"], capture_output=True, text=True).stdout
+        found = re.findall(r"inet (\d+\.\d+\.\d+\.\d+)", out)
+    except OSError:
+        pass
+    if not found:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("192.0.2.1", 9))
+            found = [s.getsockname()[0]]
+            s.close()
+        except OSError:
+            found = ["127.0.0.1"]
+
+    def is_private(ip):
+        a, b = (int(x) for x in ip.split(".")[:2])
+        return a == 10 or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168)
+
+    usable = [ip for ip in found if is_private(ip) or is_tailscale(ip)] or found
+    usable = [ip for ip in usable if not ip.startswith("172.")] or usable  # docker bridges
+    return sorted(dict.fromkeys(usable), key=is_tailscale)
+
+
+def load_token():
+    path = private_dir() / "token"
+    if not path.exists():
+        write_private(path, os.urandom(16).hex())
+    return path.read_text().strip()
+
+
+def pairing_link(hosts, port, token):
+    query = [("h", f"{h}:{port}") for h in hosts] + [("k", token)]
+    return "peek://connect?" + urllib.parse.urlencode(query, safe=":")
+
+
+def print_pairing(link):
+    print()
+    if sys.stdout.isatty():
+        print(qr_text(link))
+        print("\n  Scan with the iPhone camera, or paste this link in the Peek app:")
+    else:
+        print("  Paste this link in the Peek app:")
+    print(f"\n  {link}\n", flush=True)
+
+
+def is_tailscale(ip):
+    a, b = (int(x) for x in ip.split(".")[:2])
+    return a == 100 and 64 <= b <= 127
+
+
+def cmd_dev(args):
+    tc = Toolchain()
+    token = load_token()
+    builder = Builder(args, tc)
+    hub = Hub(builder, Signer(tc), token)
+    hosts = args.host or local_addresses()
+    # Listen on the advertised addresses and on loopback (for `peek shot`) only.
+    if args.bind:
+        binds = [args.bind]
+    else:
+        binds = sorted({h for h in hosts if h in local_addresses() or h == "127.0.0.1"} | {"127.0.0.1"})
+        if any(h not in binds for h in hosts):  # --host is not a local address (NAT): listen everywhere
+            binds = ["0.0.0.0"]
+    handler = make_handler(hub)
+    for address in binds:
+        try:
+            server = ThreadingHTTPServer((address, args.port), handler)
+        except OSError as e:
+            sys.exit(f"peek: cannot listen on {address}:{args.port}: {e}")
+        server.daemon_threads = True
+        server.handle_error = lambda request, client: None  # dropped long-polls are normal
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    print(f"peek {VERSION} — watching {builder.single or builder.root} (iOS {builder.ios})")
+    print_pairing(pairing_link(hosts, args.port, token))
+    if not hub.signer.ready:
+        log("no signing certificate yet: in the Peek app tap “Import from SideStore”", "yellow")
+
+    advertiser = None
+    lan = [h for h in local_addresses() if not is_tailscale(h) and h != "127.0.0.1"
+           and ("0.0.0.0" in binds or h in binds)]
+    if lan and not args.no_discovery:
+        advertiser = Advertiser(builder.name, args.port, lan, {
+            "id": derive(token, "peek-id").hex()[:8],
+            "hosts": ",".join(f"{h}:{args.port}" for h in hosts),
+        })
+
+    # Lets `peek shot` find this server.
+    local = "127.0.0.1" if "127.0.0.1" in binds or "0.0.0.0" in binds else binds[0]
+    (STATE_DIR / "server.json").write_text(json.dumps({"host": local, "port": args.port, "pid": os.getpid()}))
+
+    seen = seen_package = None
+    cert_stamp = hub.signer.stamp()
+    try:
+        while True:
+            if hub.signer.stamp() != cert_stamp:  # installed from the phone or with `peek cert`
+                cert_stamp = hub.signer.stamp()
+                with hub.lock:
+                    hub.signer.reload()
+                    if hub.state.get("status") != "error":
+                        log("signing certificate changed", "dim")
+                        hub.resign()
+            package, current = builder.package_fingerprint(), builder.fingerprint()
+            if (package, current) != (seen_package, seen):
+                if seen is not None:
+                    time.sleep(0.05)  # let editors finish writing
+                if package != seen_package:
+                    hub.refresh_package()
+                # Read again: the dependency build may create files (Package.resolved, bundles).
+                seen_package, seen = builder.package_fingerprint(), builder.fingerprint()
+                hub.rebuild()
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        print()
+    finally:
+        if advertiser:
+            advertiser.close()
+        try:
+            if json.loads((STATE_DIR / "server.json").read_text()).get("pid") == os.getpid():
+                (STATE_DIR / "server.json").unlink()
+        except (OSError, ValueError):
+            pass
+
+
+def cmd_shot(args):
+    """Saves a screenshot of what the phone is showing (asks the running `peek dev`)."""
+    token = load_token()
+    try:
+        info = json.loads((STATE_DIR / "server.json").read_text())
+    except (OSError, ValueError):
+        sys.exit("peek: no dev server is running (start `peek dev` first)")
+    path = "/v1/shot-request"
+    request = urllib.request.Request(
+        f"http://{info['host']}:{info['port']}{path}", data=b"", method="POST",
+        headers={"X-Peek-Auth": auth_header(token, "POST", path, device="peek-cli"), "X-Peek-Device": "peek-cli"})
+    try:
+        with urllib.request.urlopen(request, timeout=40) as response:
+            png = unseal(token, response.read())
+    except urllib.error.HTTPError as e:
+        try:
+            reason = json.loads(e.read()).get("error")
+        except ValueError:
+            reason = None
+        sys.exit(f"peek: {reason or e}")
+    except (OSError, ValueError) as e:
+        sys.exit(f"peek: could not reach the dev server: {e}")
+    out = Path(args.output or time.strftime("peek-%Y%m%d-%H%M%S.png"))
+    out.write_bytes(png)
+    print(out)
+
+
+def cmd_cert(args):
+    """Installs the signing certificate from a .p12 file (instead of sending it from the phone)."""
+    import getpass
+    path = Path(args.file)
+    if not path.is_file():
+        sys.exit(f"peek: {path} is not a file")
+    password = args.password if args.password is not None else getpass.getpass("Certificate password: ")
+    try:
+        private_dir()
+        info = Signer(Toolchain()).install(path.read_bytes(), password)
+    except ValueError as e:
+        sys.exit(f"peek: {e}")
+    print(f"installed: {info['name']} (team {info['team']}, expires {info['expires']})")
+
+
+def cmd_link(args):
+    link = pairing_link(args.host or local_addresses(), args.port, load_token())
+    if args.qr:
+        print(qr_text(link))
+    print(link)
+
+
+def cmd_build(args):
+    builder = Builder(args, Toolchain())
+    if builder.is_package:
+        builder.prepare_package()
+    result = builder.build(1)
+    if not result["ok"]:
+        print(result["diagnostics"])
+        sys.exit(1)
+    print(f"ok in {result['seconds']:.1f}s: {result['dylib']}")
+    print(f"previews: {', '.join(result['roots'])}")
+    if result["resources"]:
+        print("resources: " + ", ".join(a for a, _ in result["resources"]))
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="peek", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--version", action="version", version=VERSION)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def common(p):
+        p.add_argument("path", nargs="?", default=".", help="a .swift file or a directory of sources (default: .)")
+        p.add_argument("--root", help='root view expression, e.g. "ContentView()" (default: #Preview blocks)')
+        p.add_argument("--app", action="store_true", help="preview the @main App even if #Preview blocks exist")
+        p.add_argument("--target", help="package target to preview (default: the app's library target)")
+        p.add_argument("--ios", help="deployment target (default: from Package.swift, else 17.0)")
+        p.add_argument("--swift-version", help="Swift language mode (default: from Package.swift, else 5)")
+        p.add_argument("--no-incremental", action="store_true", help="compile everything on every change, as a new module")
+        p.add_argument("--swiftc-flag", action="append", help="extra flag passed to swiftc (repeatable)")
+
+    dev = sub.add_parser("dev", help="watch, build and serve previews to the phone")
+    common(dev)
+    dev.add_argument("--port", type=int, default=8765)
+    dev.add_argument("--bind", help="address to listen on (default: the addresses in the pairing link, and loopback)")
+    dev.add_argument("--host", action="append", help="address to advertise in the pairing link (repeatable)")
+    dev.add_argument("--no-discovery", action="store_true", help="do not advertise the server with Bonjour")
+    dev.set_defaults(func=cmd_dev)
+
+    build = sub.add_parser("build", help="compile once and report errors (no server)")
+    common(build)
+    build.set_defaults(func=cmd_build)
+
+    cert = sub.add_parser("cert", help="install the signing certificate from a .p12 file")
+    cert.add_argument("file")
+    cert.add_argument("--password", help="certificate password (default: ask)")
+    cert.set_defaults(func=cmd_cert)
+
+    shot = sub.add_parser("shot", help="save a screenshot of the preview on the phone")
+    shot.add_argument("-o", "--output", help="file to write (default: peek-<time>.png)")
+    shot.set_defaults(func=cmd_shot)
+
+    link = sub.add_parser("link", help="print the pairing link")
+    link.add_argument("--port", type=int, default=8765)
+    link.add_argument("--host", action="append")
+    link.add_argument("--qr", action="store_true", help="also print a QR code")
+    link.set_defaults(func=cmd_link)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
