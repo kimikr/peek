@@ -28,7 +28,10 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
+# Bumped whenever the app and this server stop understanding each other. The app sends its
+# number in X-Peek-Protocol (0.1.0 sends none, which means 1); a mismatch gets a clear reply.
+PROTOCOL = 1
 STATE_DIR = Path(os.environ.get("PEEK_HOME", Path.home() / ".peek"))
 SKIP_DIRS = {".build", ".git", ".peek", "Tests", "xtool", "node_modules", ".swiftpm"}
 AUTH_WINDOW = 300  # seconds of clock skew tolerated on signed requests
@@ -71,7 +74,7 @@ def log(msg, color=None):
 class Toolchain:
     """Locates swiftc, the Darwin Swift SDK bundle, and ldid."""
 
-    def __init__(self):
+    def __init__(self, strict=True):
         self.swiftc = self._find("swiftc", [Path.home() / ".local/share/swiftly/bin/swiftc"])
         self.ldid = self._find("ldid", [Path.home() / ".local/bin/ldid"])
         self.openssl = self._find("openssl", [])
@@ -91,8 +94,9 @@ class Toolchain:
                 self.runtime = runtime[-1] if runtime else None
         missing = [n for n, v in (("swiftc", self.swiftc), ("ldid", self.ldid), ("openssl", self.openssl),
                                   ("a Darwin Swift SDK (install with `xtool sdk install`)", self.sdk)) if not v]
-        if missing:
-            sys.exit("peek: missing " + ", ".join(missing))
+        self.missing = missing
+        if missing and strict:
+            sys.exit("peek: missing " + ", ".join(missing) + " (run `peek doctor` for details)")
 
     def swift_build(self, package_dir, scratch, extra=()):
         """Builds a package for iOS the way xtool does (SwiftPM's swiftbuild backend)."""
@@ -1479,13 +1483,25 @@ class Hub:
         self.devices = {}
         self.lock = threading.Lock()  # serialises builds and certificate installs
         self.archives = {}  # resource archive id -> bytes
+        self.devices_saved = 0
         self.shot = 0  # screenshot requests so far; the phone answers each one
         self.shots = {}  # request number -> PNG bytes
 
     def snapshot(self):
         cert = self.signer.info or {}
-        return {"version": self.version, "project": self.builder.name, "peek": VERSION, "shot": self.shot,
+        return {"version": self.version, "project": self.builder.name, "peek": VERSION, "protocol": PROTOCOL,
+                "shot": self.shot,
                 "hasCert": self.signer.ready, "team": cert.get("team"), **self.state}
+
+    def save_devices(self):
+        """Phones seen recently, for `peek doctor` (written at most every 10 s)."""
+        if time.time() - self.devices_saved < 10:
+            return
+        self.devices_saved = time.time()
+        try:
+            (STATE_DIR / "devices.json").write_text(json.dumps(self.devices))
+        except OSError:
+            pass
 
     def publish(self, state, dylib=None, deps=None):
         with self.cond:
@@ -1640,13 +1656,29 @@ def make_handler(hub):
                 return False
 
         def seen(self):
+            """Records the phone; false (with a reply sent) when its app speaks another protocol."""
             name = printable(urllib.parse.unquote(self.headers.get("X-Peek-Device", "device")))[:64]
             if name == "peek-cli":
-                return
-            if name not in hub.devices:
-                log(f"connected: {name} ({self.client_address[0]})", "green")
-            hub.devices[name] = time.time()
+                return True
+            app = printable(self.headers.get("X-Peek-App", "0.1.0"))[:16]
+            try:
+                protocol = int(self.headers.get("X-Peek-Protocol", "1"))
+            except ValueError:
+                protocol = 0
+            if protocol != PROTOCOL:
+                if hub.devices.get(name, {}).get("app") != app:
+                    newer = "server" if protocol < PROTOCOL else "app"
+                    log(f"{name} runs Peek {app}, which does not work with peek {VERSION}: "
+                        f"update the {'app' if newer == 'server' else 'peek script'} so both are from the same release", "red")
+                hub.devices[name] = {"seen": time.time(), "app": app, "address": self.client_address[0]}
+                self.reply(426, {"error": "version mismatch", "peek": VERSION, "protocol": PROTOCOL})
+                return False
+            if name not in hub.devices or hub.devices[name].get("app") != app:
+                log(f"connected: {name} (Peek {app}, {self.client_address[0]})", "green")
+            hub.devices[name] = {"seen": time.time(), "app": app, "address": self.client_address[0]}
+            hub.save_devices()
             hub.adopt(self.headers.get("X-Peek-Bundle"))
+            return True
 
         def do_GET(self):
             url = urllib.parse.urlparse(self.path)
@@ -1655,7 +1687,8 @@ def make_handler(hub):
                 return self.reply(200, b"peek dev server. Open the pairing link in the Peek app.\n", "text/plain")
             if not self.authed():
                 return self.reply(401, {"error": "unauthorized"})
-            self.seen()
+            if not self.seen():
+                return
             if url.path == "/v1/state":
                 after = int(query.get("after", ["-1"])[0])
                 shot = int(query.get("shot", [str(hub.shot)])[0])
@@ -1708,7 +1741,8 @@ def make_handler(hub):
             body = self.rfile.read(length)
             if not self.authed(body):
                 return self.reply(401, {"error": "unauthorized"})
-            self.seen()
+            if not self.seen():
+                return
             if url.path == "/v1/log":
                 try:
                     entry = json.loads(body)
@@ -1878,6 +1912,122 @@ def cmd_dev(args):
             pass
 
 
+def cmd_doctor(args):
+    """Checks everything peek needs, from the toolchain to the phone, and says how to fix what is not right."""
+    problems = 0
+
+    def report(ok, what, detail="", fix=""):
+        nonlocal problems
+        mark = {True: ("✓", "green"), False: ("✗", "red"), None: ("!", "yellow")}[ok]
+        if ok is False:
+            problems += 1
+        line = f"{mark[0]} {what}" + (f": {detail}" if detail else "")
+        print(f"\033[{ {'green': 32, 'red': 31, 'yellow': 33}[mark[1]] }m{line}\033[0m" if sys.stdout.isatty() else line)
+        if fix and ok is not True:
+            print(f"    → {fix}")
+
+    def run(*cmd):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+
+    print(f"peek {VERSION} (protocol {PROTOCOL})\n")
+    report(sys.version_info >= (3, 9), "Python", sys.version.split()[0], "peek needs Python 3.9 or newer")
+    tc = Toolchain(strict=False)
+    report(bool(tc.swiftc), "Swift compiler", (run(tc.swiftc, "--version").splitlines() or [""])[0] if tc.swiftc else "not found",
+           "install a Swift 6 toolchain, e.g. with xtool (`xtool setup`) or swiftly")
+    sdk = ""
+    if tc.sdk:
+        try:
+            settings = json.loads((tc.sdk / "SDKSettings.json").read_text())
+            sdk = f"{settings.get('DisplayName') or 'iOS ' + settings.get('Version', '?')} ({tc.sdk.resolve()})"
+        except (OSError, ValueError):
+            sdk = str(tc.sdk.resolve())
+    report(bool(tc.sdk), "iOS SDK", sdk or "no Darwin Swift SDK in ~/.swiftpm/swift-sdks",
+           "install it with xtool (`xtool setup`, or `xtool sdk install <Xcode.xip>`)")
+    if tc.sdk:
+        report(bool(tc.linker), "linker", str(tc.linker or "ld64.lld not found in the SDK bundle"), "reinstall the SDK with xtool")
+    report(bool(tc.ldid), "ldid", tc.ldid or "not found",
+           "install it: scripts/install.sh does, or get a build from github.com/ProcursusTeam/ldid/releases")
+    report(bool(tc.openssl), "openssl", run(tc.openssl, "version") if tc.openssl else "not found",
+           "install it with your package manager (e.g. `sudo apt install openssl`)")
+
+    print()
+    report((STATE_DIR / "token").exists() or None, "pairing key",
+           str(STATE_DIR / "token") if (STATE_DIR / "token").exists() else "not created yet",
+           "it is created the first time you run `peek dev`")
+    signer = Signer(tc) if tc.openssl else None
+    if signer and signer.ready:
+        expires = signer.info.get("expires", "")
+        try:
+            left = (time.mktime(time.strptime(expires.replace(" GMT", ""), "%b %d %H:%M:%S %Y")) - time.time()) / 86400
+            when = f"expires {expires} ({left:.0f} days)"
+            ok = True if left > 7 else (None if left > 0 else False)
+        except ValueError:
+            when, ok = f"expires {expires}", True
+        report(ok, "signing certificate", f"{signer.info.get('name')}, team {signer.info.get('team')}, {when}",
+               "import the current certificate again from the Peek app")
+    else:
+        report(None, "signing certificate", "none yet",
+               "start `peek dev`, then tap “Import from SideStore” (or import a .p12) in the Peek app")
+    if signer:
+        report(True if signer.identifier else None, "signing identifier", signer.identifier or "not known yet",
+               "the phone reports it the first time it connects")
+
+    print()
+    addresses = local_addresses()
+    labels = [f"{a} ({'Tailscale' if is_tailscale(a) else 'LAN'})" for a in addresses]
+    report(bool(addresses) and addresses != ["127.0.0.1"] or None, "network", ", ".join(labels) or "no address",
+           "the phone must reach one of these: same Wi-Fi, or the same Tailscale network")
+    running = None
+    try:
+        info = json.loads((STATE_DIR / "server.json").read_text())
+        os.kill(info["pid"], 0)
+        running = info
+    except (OSError, ValueError, KeyError):
+        pass
+    if running:
+        report(True, "dev server", f"running (pid {running['pid']}, port {running['port']})")
+    else:
+        with socket.socket() as sock:
+            busy = sock.connect_ex(("127.0.0.1", args.port)) == 0
+        report(None if not busy else False, "dev server", "not running" if not busy else f"port {args.port} is used by another program",
+               "run `peek dev <your app>`" if not busy else f"stop that program or use `peek dev --port <n>`")
+    try:
+        devices = json.loads((STATE_DIR / "devices.json").read_text())
+    except (OSError, ValueError):
+        devices = {}
+    if devices:
+        for name, device in devices.items():
+            if not isinstance(device, dict):
+                continue
+            ago = (time.time() - device.get("seen", 0)) / 60
+            report(True if device.get("app") == VERSION else None, f"phone “{name}”",
+                   f"Peek {device.get('app')}, last seen {ago:.0f} min ago from {device.get('address')}",
+                   "install the Peek app from the same release as this script")
+    else:
+        report(None, "phone", "has not connected yet", "open the pairing link from `peek dev` in the Peek app")
+
+    if not args.no_build and tc.swiftc and tc.sdk and not tc.missing:
+        print()
+        work = Path(__import__("tempfile").mkdtemp(prefix="peek-doctor-"))
+        try:
+            (work / "ContentView.swift").write_text("import SwiftUI\n\nstruct ContentView: View {\n"
+                                                   "    var body: some View { Text(\"peek\") }\n}\n")
+            build_args = argparse.Namespace(path=str(work), root=None, app=False, target=None, ios=None,
+                                            swift_version=None, swiftc_flag=None, no_incremental=True)
+            result = Builder(build_args, tc).build(1)
+            report(result["ok"], "test build", f"{result.get('seconds', 0):.1f}s" if result["ok"] else
+                   result["diagnostics"].strip().splitlines()[-1][:200], "see the compiler message above; `peek build` shows all of it")
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+            shutil.rmtree(STATE_DIR / "build" / hashlib.sha1(str(work.resolve()).encode()).hexdigest()[:12], ignore_errors=True)
+
+    print("\nAll good." if not problems else f"\n{problems} problem(s) found.")
+    sys.exit(1 if problems else 0)
+
+
 def cmd_shot(args):
     """Saves a screenshot of what the phone is showing (asks the running `peek dev`)."""
     token = load_token()
@@ -1972,6 +2122,11 @@ def main():
     cert.add_argument("file")
     cert.add_argument("--password", help="certificate password (default: ask)")
     cert.set_defaults(func=cmd_cert)
+
+    doctor = sub.add_parser("doctor", help="check the toolchain, certificate, network and phone")
+    doctor.add_argument("--port", type=int, default=8765)
+    doctor.add_argument("--no-build", action="store_true", help="skip the test build")
+    doctor.set_defaults(func=cmd_doctor)
 
     shot = sub.add_parser("shot", help="save a screenshot of the preview on the phone")
     shot.add_argument("-o", "--output", help="file to write (default: peek-<time>.png)")

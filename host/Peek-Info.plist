@@ -2,12 +2,20 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.1</string>
+	<key>CFBundleVersion</key>
+	<string>2</string>
     <key>CFBundleDisplayName</key>
     <string>Peek</string>
     <!-- peek://connect?... pairing links and the certificate callback from SideStore/AltStore -->
     <key>CFBundleURLTypes</key>
     <array>
         <dict>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.1</string>
+	<key>CFBundleVersion</key>
+	<string>2</string>
             <key>CFBundleURLName</key>
             <string>kim.jihwan.peek</string>
             <key>CFBundleURLSchemes</key>
@@ -24,6 +32,10 @@
     <!-- The dev server is plain HTTP on the LAN or a Tailscale address -->
     <key>NSAppTransportSecurity</key>
     <dict>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.1</string>
+	<key>CFBundleVersion</key>
+	<string>2</string>
         <key>NSAllowsArbitraryLoads</key>
         <true/>
     </dict>

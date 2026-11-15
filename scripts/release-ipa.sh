@@ -7,6 +7,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 version=$(./peek --version)
+python3 -m unittest tests.test_peek.Versions >/dev/null 2>&1 \
+    || { echo "app and script versions differ: run python3 -m unittest tests.test_peek.Versions" >&2; exit 1; }
 (cd host && xtool dev build --ipa -c release)
 mkdir -p dist
 cp host/xtool/Peek.ipa "dist/Peek-$version.ipa"

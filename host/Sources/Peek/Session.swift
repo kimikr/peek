@@ -1,6 +1,20 @@
 import Foundation
 import Observation
 import UIKit
+import os
+
+/// This app's release, and the version of the protocol it speaks with the `peek` script.
+/// Both must match the script's VERSION and PROTOCOL (the release script checks).
+enum PeekVersion {
+    static let app = "0.1.1"
+    static let proto = 1
+}
+
+/// The dev server answered with HTTP 426: it speaks another protocol version.
+struct VersionMismatch: LocalizedError {
+    let server: String
+    var errorDescription: String? { "The dev server runs peek \(server), which needs a different version of this app." }
+}
 
 /// What the dev server reports from `GET /v1/state`.
 struct ServerState: Decodable, Equatable {
@@ -16,6 +30,8 @@ struct ServerState: Decodable, Equatable {
     var resources: Resources?
     var deps: Resources?  // the package's dependencies, linked once into a library of their own
     var shot: Int?  // screenshot requests so far (`peek shot`)
+    var peek: String?
+    var `protocol`: Int?  // absent from 0.1.0 servers, which speak protocol 1
 
     struct Resources: Decodable, Equatable {
         var id: String
@@ -31,6 +47,7 @@ enum Phase: Equatable {
     case showing
     case loadFailed(String)
     case crashedLastTime
+    case incompatible(server: String)
 }
 
 @MainActor
@@ -47,6 +64,9 @@ final class Session {
     private(set) var certificateMessage: String?
     /// Why the newest build could not be loaded while an older one is still on screen.
     private(set) var loadError: String?
+    /// Set when iOS is about to run out of memory for Peek: every reload keeps the old build loaded.
+    private(set) var memoryLow = false
+    private var memoryReported = false
     var rootIndex = 0 { didSet { if rootIndex != oldValue { showRoot() } } }
     var appearance = Appearance(rawValue: UserDefaults.standard.string(forKey: "appearance") ?? "") ?? .system {
         didSet {
@@ -87,6 +107,10 @@ final class Session {
     init() {
         crashedKey = defaults.string(forKey: "loadingBuild")
         output.start()
+        NotificationCenter.default.addObserver(forName: UIApplication.didReceiveMemoryWarningNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.noteMemory(warning: true) }
+        }
         // Builds from earlier launches; ones loaded in this process must stay on disk.
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         try? FileManager.default.removeItem(at: caches.appendingPathComponent("builds", isDirectory: true))
@@ -253,6 +277,9 @@ final class Session {
         var version = -1
         while !Task.isCancelled {
             if activeHost == nil {
+                if let server = incompatibleServer {
+                    phase = .incompatible(server: server)
+                }
                 if let (host, state) = await probe(candidateHosts()) {
                     activeHost = host
                     remember(host)
@@ -292,13 +319,24 @@ final class Session {
         }
     }
 
+    /// Set while the server refuses this app's protocol version.
+    private var incompatibleServer: String?
+
     /// Tries every address at once and returns the first that answers.
     private func probe(_ hosts: [String]) async -> (String, ServerState)? {
         await withTaskGroup(of: (String, ServerState)?.self) { group in
             for host in hosts {
                 group.addTask { [weak self] in
-                    guard let state = try? await self?.fetchState(host: host, after: -1, wait: 0, timeout: 4) else { return nil }
-                    return (host, state)
+                    do {
+                        guard let state = try await self?.fetchState(host: host, after: -1, wait: 0, timeout: 4) else { return nil }
+                        await self?.setIncompatible(nil)
+                        return (host, state)
+                    } catch let mismatch as VersionMismatch {
+                        await self?.setIncompatible(mismatch.server)
+                        return nil
+                    } catch {
+                        return nil
+                    }
                 }
             }
             for await result in group {
@@ -309,6 +347,27 @@ final class Session {
             }
             return nil
         }
+    }
+
+    private func setIncompatible(_ server: String?) {
+        incompatibleServer = server
+        if let server { phase = .incompatible(server: server) }
+    }
+
+    /// Notes how much memory is left after a load; past a threshold, suggests restarting Peek.
+    private func noteMemory(warning: Bool = false) {
+        let left = os_proc_available_memory() / (1 << 20)
+        guard warning || (left > 0 && left < 250) else { return }
+        memoryLow = true
+        guard !memoryReported else { return }
+        memoryReported = true
+        log("memory is running low (\(left) MB left after \(loadCount) reloads): restart Peek to free old builds",
+            level: "warn")
+    }
+
+    /// Quits Peek so that iOS frees every loaded build; opening it again loads the newest one.
+    func restart() {
+        exit(0)
     }
 
     private func sendSnapshot(_ number: Int) async {
@@ -367,6 +426,7 @@ final class Session {
             let loaded = try LoadedBuild(path: file.path)
             build = loaded
             loadError = nil
+            noteMemory()
             if rootIndex >= (state.roots?.count ?? 1) { rootIndex = 0 }
             showRoot()
             log("loaded build \(state.version) (\(data.count / 1024) KB)")
@@ -433,10 +493,18 @@ final class Session {
 
     private func fetchState(host: String, after: Int, wait: Int, timeout: TimeInterval) async throws -> ServerState {
         let (data, response) = try await request("GET", "/v1/state?after=\(after)&wait=\(wait)", host: host, timeout: timeout)
+        if response.statusCode == 426 {
+            let reply = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            throw VersionMismatch(server: reply?["peek"] as? String ?? "?")
+        }
         guard response.statusCode == 200 else {
             throw URLError(response.statusCode == 401 ? .userAuthenticationRequired : .badServerResponse)
         }
-        return try JSONDecoder().decode(ServerState.self, from: data)
+        let state = try JSONDecoder().decode(ServerState.self, from: data)
+        if (state.protocol ?? 1) != PeekVersion.proto {
+            throw VersionMismatch(server: state.peek ?? "?")
+        }
+        return state
     }
 
     private func request(_ method: String, _ path: String, host: String? = nil, body: Data = Data(),
@@ -452,6 +520,8 @@ final class Session {
         request.setValue(key.authHeader(method: method, path: path, body: body, bundle: bundle, device: device),
                          forHTTPHeaderField: "X-Peek-Auth")
         request.setValue(device, forHTTPHeaderField: "X-Peek-Device")
+        request.setValue(PeekVersion.app, forHTTPHeaderField: "X-Peek-App")
+        request.setValue(String(PeekVersion.proto), forHTTPHeaderField: "X-Peek-Protocol")
         request.setValue(bundle, forHTTPHeaderField: "X-Peek-Bundle")
         if method == "POST" { request.httpBody = body }
         let (data, response) = try await http.data(for: request)

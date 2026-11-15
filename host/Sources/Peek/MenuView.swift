@@ -34,11 +34,21 @@ struct MenuView: View {
                         }
                     }
                 }
+                if session.memoryLow {
+                    Section {
+                        Button("Quit Peek", role: .destructive) { session.restart() }
+                    } header: {
+                        Text("Memory")
+                    } footer: {
+                        Text("Every reload keeps the previous build in memory, and iOS is close to closing Peek. Quit and open it again to start fresh; the newest build loads right away.")
+                    }
+                }
                 Section("Dev server") {
                     LabeledContent("Project", value: session.server?.project ?? "—")
                     LabeledContent("Address", value: session.activeHost ?? "not connected")
                     LabeledContent("Build", value: buildSummary)
                     LabeledContent("Signing team", value: session.server?.team ?? "no certificate")
+                    LabeledContent("Versions", value: "app \(PeekVersion.app) · server \(session.server?.peek ?? "—")")
                 }
                 Section {
                     CertificateButtons()

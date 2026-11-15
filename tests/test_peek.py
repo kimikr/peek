@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -187,6 +188,17 @@ class Hardening(unittest.TestCase):
         self.assertEqual(package.link_flags, ["-Xlinker", "-x"])
 
 
+class Versions(unittest.TestCase):
+    """The app and the script must agree, or a release ships a pair that cannot talk."""
+
+    def test_app_matches_script(self):
+        swift = (ROOT / "host/Sources/Peek/Session.swift").read_text()
+        plist = (ROOT / "host/Peek-Info.plist").read_text()
+        self.assertIn(f'static let app = "{peek.VERSION}"', swift)
+        self.assertIn(f"static let proto = {peek.PROTOCOL}", swift)
+        self.assertRegex(plist, rf"CFBundleShortVersionString</key>\s*<string>{re.escape(peek.VERSION)}</string>")
+
+
 class PackageEdits(unittest.TestCase):
     def test_only_dependency_sources(self):
         package = peek.Package.__new__(peek.Package)
@@ -292,6 +304,7 @@ class Server(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         folder = Path(self.tmp.name)
+        self.state_dir, peek.STATE_DIR = peek.STATE_DIR, folder  # keep the real ~/.peek out of tests
         (folder / "PeekDeps-abc.signed.dylib").write_bytes(b"signed deps")
         peek.log = lambda *a, **k: None
         self.hub = peek.Hub(FakeBuilder(folder), FakeSigner(), TOKEN)
@@ -303,13 +316,14 @@ class Server(unittest.TestCase):
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
 
     def tearDown(self):
+        peek.STATE_DIR = self.state_dir
         self.server.shutdown()
         self.server.server_close()
         self.tmp.cleanup()
 
-    def call(self, method, path, body=b"", bundle="com.example.host", device="phone", tamper=None):
+    def call(self, method, path, body=b"", bundle="com.example.host", device="phone", tamper=None, extra=None):
         headers = {"X-Peek-Auth": peek.auth_header(TOKEN, method, path, body, bundle, device),
-                   "X-Peek-Bundle": tamper or bundle, "X-Peek-Device": device}
+                   "X-Peek-Bundle": tamper or bundle, "X-Peek-Device": device, **(extra or {})}
         request = urllib.request.Request(self.base + path, data=body if method == "POST" else None,
                                          method=method, headers=headers)
         with urllib.request.urlopen(request, timeout=10) as response:
@@ -383,6 +397,17 @@ class Server(unittest.TestCase):
         state = json.loads(self.call("GET", "/v1/state?after=-1&wait=0"))
         self.assertEqual(state["status"], "error")
         self.assertIn("gone", state["diagnostics"])
+
+    def test_versions(self):
+        # 0.1.0 apps send no protocol header and speak protocol 1.
+        state = json.loads(self.call("GET", "/v1/state?after=-1&wait=0"))
+        self.assertEqual(state["protocol"], peek.PROTOCOL)
+        ok = {"X-Peek-App": peek.VERSION, "X-Peek-Protocol": str(peek.PROTOCOL)}
+        self.assertEqual(json.loads(self.call("GET", "/v1/state?after=-1&wait=0", extra=ok))["peek"], peek.VERSION)
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            self.call("GET", "/v1/state?after=-1&wait=0", extra={"X-Peek-App": "9.0", "X-Peek-Protocol": "9"})
+        self.assertEqual(e.exception.code, 426)
+        self.assertEqual(json.loads(e.exception.read())["peek"], peek.VERSION)
 
     def test_output_is_accepted(self):
         body = json.dumps({"level": "print", "output": "hello\nworld\n"}).encode()

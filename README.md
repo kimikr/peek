@@ -81,16 +81,20 @@ On the iPhone (iOS 17+):
 ## Quick start
 
 ```sh
-# 1. Build the host app and install the IPA with SideStore/AltStore
-cd host && xtool dev build --ipa -c release     # → host/xtool/Peek.ipa
+# 1. Install peek (and ldid, if missing) into ~/.local
+curl -fsSL https://raw.githubusercontent.com/kimikr/peek/main/scripts/install.sh | sh
 
-# 2. Start previewing
-./peek dev examples/Counter
+# 2. Check that everything is in place
+peek doctor
+
+# 3. Start previewing
+peek dev ~/.local/share/peek/examples/Counter
 ```
 
-Or skip step 1 and install the IPA attached to a
-[release](../../releases) (built with `scripts/release-ipa.sh`; the store signs
-it for you).
+On the phone, install `Peek-<version>.ipa` from the [releases](../../releases)
+with SideStore or AltStore (they sign it for you), or add it to LiveContainer.
+Use the app and the `peek` script from the same release; if they don't match,
+the app says so. To build the app yourself: `cd host && xtool dev build --ipa -c release`.
 
 `peek dev` prints a QR code and a pairing link. Scan the code with the Camera
 app (Peek asks you to confirm the server) or paste the link into Peek. The
@@ -103,6 +107,11 @@ a `.p12` file and use **Import a .p12 file…**. It must be the certificate
 LiveContainer itself is signed with.
 
 Then edit `examples/Counter/ContentView.swift` and save.
+
+**Something not working?** `peek doctor` checks the toolchain, the iOS SDK,
+ldid, the signing certificate (and when it expires), the network addresses,
+whether the dev server is running, which phones connected with which app
+version, and does a test build.
 
 ### What gets previewed
 
@@ -190,7 +199,8 @@ in the link is used. Pair with `peek link --qr` at any time.
 - **Previewing Peek with Peek** shows "The last build quit the app" in the
   inner copy, because both copies share one set of preferences.
 - **Old builds stay in memory** until the app is restarted (dependencies
-  are loaded once).
+  are loaded once). When memory runs low, the green dot turns orange and the
+  menu offers to quit Peek; open it again and the newest build loads.
 - **Free Apple IDs:** the certificate changes when the store re-issues it;
   import it again when builds stop loading.
 
@@ -236,7 +246,8 @@ in the link is used. Pair with `peek link --qr` at any time.
 ## Development
 
 ```sh
-python3 -m unittest discover tests     # server tests (Python + openssl only)
+python3 -m unittest discover tests     # tests (Python + openssl only)
+./peek doctor                          # check the local setup
 ./peek build examples/Weather          # compile once, print errors
 scripts/release-ipa.sh                 # unsigned IPA for a release
 ```

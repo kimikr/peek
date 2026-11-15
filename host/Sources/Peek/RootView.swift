@@ -7,7 +7,7 @@ struct RootView: View {
     @State private var dismissedError: String?
     @State private var stage = Stage()
 
-    private var healthy: Bool { session.activeHost != nil && session.buildError == nil }
+    private var healthy: Bool { session.activeHost != nil && session.buildError == nil && !session.memoryLow }
 
     var body: some View {
         // A loaded preview is shown by `stage` in a window above this one.
@@ -76,6 +76,14 @@ private struct StatusView: View {
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
                 CertificateButtons()
+            case .incompatible(let server):
+                Image(systemName: "arrow.triangle.2.circlepath").font(.largeTitle).foregroundStyle(.orange)
+                Text("Versions don't match").font(.title3.bold())
+                Text("The dev server runs peek \(server), and this is Peek \(PeekVersion.app). Use the app and the peek script from the same release.")
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.secondary)
+                Link("Releases", destination: URL(string: "https://github.com/kimikr/peek/releases")!)
+                    .buttonStyle(.bordered)
             case .crashedLastTime:
                 Image(systemName: "bolt.trianglebadge.exclamationmark").font(.largeTitle).foregroundStyle(.orange)
                 Text("The last build quit the app").font(.title3.bold())
