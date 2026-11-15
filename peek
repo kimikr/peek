@@ -863,8 +863,11 @@ class Package:
         everything = {t["name"]: t for t in info["targets"]}
         # Local macro targets are built for the host; binary targets cannot be built on their own,
         # so peek unpacks those it needs itself (see stage_binaries).
-        self.direct_targets = [t for t in target.get("target_dependencies") or []
-                               if t in targets or everything.get(t, {}).get("type") == "macro"]
+        self.direct_targets = [t for t in target.get("target_dependencies") or [] if t in targets]
+        # Macro targets cannot be built on their own (SwiftBuild has a host and a device copy of
+        # each and refuses the name), so a package with local macros is built as a whole.
+        self.local_macros = [n for n in needed | set(target.get("target_dependencies") or [])
+                             if everything.get(n, {}).get("type") == "macro"]
         self.binaries = {n: everything[n].get("path") for n in needed | set(target.get("target_dependencies") or [])
                          if everything.get(n, {}).get("type") == "binary"}
         # The previewed target's resources: peek assembles its bundle (SwiftPM would need actool
@@ -940,6 +943,17 @@ class Package:
         catalog in it would stop the whole build on Linux (no actool)."""
         runs = [("--target", t) for t in self.direct_targets] + [("--product", p) for p in self.direct_products]
         output, ok = [], True
+        if self.local_macros and not dependencies_only:
+            # Builds the previewed target too; only the macros matter, so its failure is ignored
+            # unless a macro did not get built.
+            proc = self.tc.swift_build(self.root, self.scratch)
+            missing = [m for m in self.local_macros if not any(
+                (folder / m).exists() for folder in self.products.parent.glob("Debug-*"))]
+            if missing:
+                output += [clean_swiftpm_line(l) for l in (proc.stdout + proc.stderr).splitlines()
+                           if not re.fullmatch(r"\[\d+ / \d+\].*", l)]
+                output.append(f"error: macro {', '.join(missing)} could not be built")
+                ok = False
         if not dependencies_only:
             try:
                 self.stage_binaries()
@@ -1519,18 +1533,20 @@ class Builder:
 
     def fingerprint(self):
         """Changes whenever a fast rebuild is needed."""
-        return self._stamp(self.sources()) + (self._stamp(p for _, p in self.resources()[1]) if not self.package else ())
+        if self.is_package and not self.package:
+            return self._stamp(self.sources())
+        return self._stamp(self.sources()) + self._stamp(p for _, p in self.resources()[1])
 
     def package_fingerprint(self):
-        """Changes whenever dependencies or resources must be rebuilt by SwiftPM (package mode only)."""
+        """Changes whenever the dependencies must be rebuilt by SwiftPM (package mode only)."""
         if not self.is_package:
             return None
         target_dir = self.package.target_dir if self.package else None
         roots = [self.root] + [d for d in (self.package.local_deps if self.package else [])
                                if self.root not in d.parents]
 
-        def previewed_source(path):
-            return path.suffix == ".swift" and target_dir is not None and target_dir in path.parents
+        def previewed_source(path):  # the previewed target's files: peek builds those itself
+            return target_dir is not None and target_dir in path.parents and path.name != "Package.swift"
 
         return self._stamp(p for base in roots for p in walk_files(base, skip=previewed_source))
 
