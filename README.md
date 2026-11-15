@@ -150,9 +150,11 @@ version, and does a test build.
 and `swiftSettings` (`define`, upcoming and experimental features, default
 isolation, `unsafeFlags`) and linker settings are applied.
 
-**Package dependencies.** In a package, peek first builds everything with
-SwiftPM (`swift build`, the same way xtool does), links the dependencies into
-one library the phone downloads once, and runs the macros SwiftPM built.
+**Package dependencies.** In a package, peek first builds the previewed
+target's dependencies with SwiftPM (`swift build`, the same way xtool does),
+links them into one library the phone downloads once, and runs the macros
+SwiftPM built. The previewed target itself is never built by SwiftPM: peek
+compiles it, unpacks its `.xcframework`s and assembles its resource bundle.
 That first build is slow; after it, saving a file in the previewed target takes
 the fast path again. Editing `Package.swift` or a dependency's sources triggers
 the SwiftPM build again. Use `--target` to pick a target other than the app's.
@@ -174,6 +176,8 @@ as loose images, colour sets (light and dark) become generated code, and
 a literal name of such an asset are pointed at them. The asset symbols Xcode
 generates (`Color(.brand)`, `.foregroundStyle(.brand)`, `Image(.logo)`,
 `UIColor(resource:)`, `UIImage(resource:)`) are generated the same way.
+String catalogs (`.xcstrings`) become `.strings` and `.stringsdict` files
+(plurals included), so `String(localized:bundle: .module)` is translated.
 
 See `examples/Weather` for a package with a dependency and a resource.
 
@@ -211,6 +215,8 @@ in the link is used. Pair with `peek link --qr` at any time.
   show a hot-patched body only once their inputs change.
 - **Asset catalogs** are not compiled: only image sets with one image per
   scale (no dark or size variants) and colour sets are available. A
+  dependency (not the previewed target) with an asset catalog or a string
+  catalog cannot be built, since SwiftPM needs Xcode's tools for those. A
   `DocumentGroup` that only views documents shows a placeholder, since there is
   no document to open.
 - **The preview lives in the Peek app's sandbox.** `UserDefaults`, the
