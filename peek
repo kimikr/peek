@@ -812,14 +812,65 @@ struct __PeekTestRunner: SwiftUI.View {
         .task {
             started = Date()
             let module = String(reflecting: __PeekTestRunner.self).split(separator: ".")[0]
+            let xctestPassed = __peekRunXCTests(module: String(module))
             let code = await Task.detached { () -> CInt in
                 var arguments = __CommandLineArguments_v0()
                 arguments.filter = ["^\\(module)\\\\."]  // this build's tests, not those of earlier builds
                 return await __swiftPMEntryPoint(passing: arguments)
             }.value
             seconds = Date().timeIntervalSince(started)
-            result = code
-            print(code == 0 ? "peek: all tests passed" : "peek: tests failed (exit code \\(code))")
+            result = xctestPassed ? code : max(code, 1)
+            print(result == 0 ? "peek: all tests passed" : "peek: tests failed")
+        }
+    }
+}
+%XCTEST%"""
+
+XCTEST_NONE = """
+@MainActor func __peekRunXCTests(module: String) -> Bool { true }  // no XCTest in these tests
+"""
+
+XCTEST_RUNNER = """
+import XCTest
+import ObjectiveC
+
+/// Runs the XCTestCase subclasses defined in this build and prints XCTest's usual log. Only this
+/// library's classes are looked at: earlier builds stay loaded, and touching arbitrary classes of
+/// the process (some are not NSObjects) can crash. Returns whether they all passed.
+@MainActor func __peekRunXCTests(module: String) -> Bool {
+    var info = Dl_info()
+    guard dladdr(#dsohandle, &info) != 0, let image = info.dli_fname else { return false }
+    var count: UInt32 = 0
+    guard let names = objc_copyClassNamesForImage(image, &count) else { return true }
+    defer { free(UnsafeMutableRawPointer(mutating: names)) }
+    let base = ObjectIdentifier(XCTestCase.self)
+    var classes: [AnyClass] = []
+    for index in 0..<Int(count) {
+        guard let candidate = objc_getClass(names[index]) as? AnyClass else { continue }
+        var parent: AnyClass? = class_getSuperclass(candidate)
+        while let current = parent, ObjectIdentifier(current) != base { parent = class_getSuperclass(current) }
+        if parent != nil { classes.append(candidate) }
+    }
+    if classes.isEmpty { return true }
+    __peekWithoutTestDaemon()
+    let suite = XCTestSuite(name: "All tests")
+    for testClass in classes.sorted(by: { NSStringFromClass($0) < NSStringFromClass($1) }) {
+        suite.addTest(XCTestSuite(forTestCaseClass: testClass))
+    }
+    suite.run()
+    return suite.testRun?.hasSucceeded ?? false
+}
+
+/// XCTest connects to testmanagerd, which only runs when Xcode has set the phone up for
+/// development; unit tests do not need it. Make XCTest see no daemon session instead of failing.
+@MainActor func __peekWithoutTestDaemon() {
+    guard let session = NSClassFromString("XCTRunnerDaemonSession") else { return }
+    let none: @convention(block) (AnyObject) -> AnyObject? = { _ in nil }
+    let noneWithFlag: @convention(block) (AnyObject, Bool) -> AnyObject? = { _, _ in nil }
+    for (name, block) in [("sharedSession", none as Any), ("sharedSessionIfInitiated", none),
+                          ("sharedSessionPromiseAndImplicitlyInitiateSession:", noneWithFlag)] {
+        if let method = class_getClassMethod(session, NSSelectorFromString(name)) {
+            method_setImplementation(method, imp_implementationWithBlock(block))
         }
     }
 }
@@ -1515,6 +1566,7 @@ class Builder:
         self.package_error = None
         self.colors, self.images = {}, set()
         self.display_names = {}
+        self.uses_xctest = False
 
     @property
     def ios(self):
@@ -1679,6 +1731,14 @@ class Builder:
         if self.tests:
             found = found + [self.tc.developer / "Library/Frameworks/Testing.framework",
                              self.tc.developer / "usr/lib/lib_TestingInterop.dylib"]
+        if self.tests and self.uses_xctest:
+            dev = self.tc.developer
+            found = found + [dev / "Library/Frameworks/XCTest.framework", dev / "Library/Frameworks/XCUIAutomation.framework",
+                             dev / "Library/Frameworks/_Testing_Foundation.framework",
+                             dev / "Library/PrivateFrameworks/XCTestCore.framework",
+                             dev / "Library/PrivateFrameworks/XCTAutomationSupport.framework",
+                             dev / "Library/PrivateFrameworks/XCTestSupport.framework",
+                             dev / "usr/lib/libXCTestSwiftSupport.dylib"]
         return found
 
     def _common_flags(self):
@@ -1691,8 +1751,10 @@ class Builder:
             cmd += ["-F", str(self.package.staged)]
             for headers in self.package.header_paths():
                 cmd += ["-I", str(headers)]
-        if self.tests:  # Testing.framework ships with the SDK, outside the SDK root
-            cmd += ["-F", str(self.tc.developer / "Library/Frameworks")]
+        if self.tests:  # Testing and XCTest ship with the SDK, outside the SDK root
+            dev = self.tc.developer
+            cmd += ["-F", str(dev / "Library/Frameworks"), "-F", str(dev / "Library/PrivateFrameworks"),
+                    "-I", str(dev / "usr/lib"), "-L", str(dev / "usr/lib")]
         return cmd
 
     def _link_flags(self):
@@ -1705,6 +1767,8 @@ class Builder:
             cmd += [a for f in self.package.frameworks() for a in ("-framework", f.stem)]
         if self.tests:
             cmd += ["-framework", "Testing"]
+        if self.tests and self.uses_xctest:
+            cmd += ["-framework", "XCTest", "-lXCTestSwiftSupport"]
         if self.shipped_frameworks():
             # The phone puts dynamic frameworks in Frameworks/ next to the builds.
             cmd += ["-Xlinker", "-rpath", "-Xlinker", "@loader_path/Frameworks"]
@@ -1779,9 +1843,8 @@ class Builder:
         if self.tests and not test_files:
             return {"ok": False, "diagnostics": "No tests found (peek test looks in the test targets of the "
                                                 "package, or in Tests/ next to Sources/)."}
-        if any(re.search(r"^[ \t]*(?:@testable[ \t]+)?import[ \t]+XCTest\b", texts[p], re.M) for p in test_files):
-            return {"ok": False, "diagnostics": "These tests use XCTest; peek test runs Swift Testing (`import Testing`, "
-                                                "@Test) only for now."}
+        self.uses_xctest = any(re.search(r"^[ \t]*(?:@testable[ \t]+)?import[ \t]+XCTest\b", texts[p], re.M)
+                               for p in test_files)
         tested = {self.package.target, re.sub(r"\W", "_", self.package.target)} if self.package else set()
         for path in sources:
             shown = path.name if self.single else str(path.relative_to(self.root))
@@ -1821,7 +1884,8 @@ class Builder:
         write_if_changed(support, SUPPORT_SOURCE + (BUNDLE_TEMPLATE.replace("%NAME%", bundle_name) if bundle_name else "")
                          + colors_source(self.colors)
                          + ("" if own_symbols else asset_symbols_source(self.colors, self.images, bool(bundle_name)))
-                         + (TEST_RUNNER_SOURCE if self.tests else ""))
+                         + (TEST_RUNNER_SOURCE.replace("%XCTEST%", XCTEST_RUNNER if self.uses_xctest else XCTEST_NONE)
+                            if self.tests else ""))
         write_if_changed(entry, ENTRY_TEMPLATE.replace("%CASES%", body))
         files = [c for c, _ in inputs] + [support, entry]
         for stale in srcdir.glob("*.swift"):
@@ -2877,7 +2941,10 @@ def make_handler(hub):
                             if DUPLICATE_CLASS_RE.match(line):
                                 continue  # every reload brings the same class names again; expected
                             line = COPY_NAME_RE.sub(lambda m: getattr(hub.builder, "display_names", {}).get(m.group(0), m.group(0)), line)
-                            color = "red" if level == "crash" or line.lstrip().startswith("✘") else "dim"
+                            if getattr(hub.builder, "out", None):  # XCTest prints #filePath
+                                line = line.replace(f"{hub.builder.out}/src/", "")
+                            failed = line.lstrip().startswith("✘") or " error: " in line or "' failed (" in line  # Swift Testing, XCTest
+                            color = "red" if level == "crash" or failed else "dim"
                             log(f"│ {printable(line)}", color)
                     elif entry.get("message"):
                         log(f"[phone] {printable(entry['message'])}", {"error": "red", "warn": "yellow"}.get(level, "dim"))

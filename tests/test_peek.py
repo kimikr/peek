@@ -377,6 +377,12 @@ class TestRunner(unittest.TestCase):
         self.assertEqual(peek.COPY_NAME_RE.sub(lambda m: names.get(m.group(0), m.group(0)), line),
                          "✘ Test x() recorded an issue at Tests/CalcTests/CalcTests.swift:25:9: Expectation failed")
 
+    def test_xctest_runner_is_added_only_when_used(self):
+        self.assertIn("%XCTEST%", peek.TEST_RUNNER_SOURCE)
+        self.assertIn("objc_copyClassNamesForImage", peek.XCTEST_RUNNER)  # never all classes: some crash
+        self.assertIn("XCTRunnerDaemonSession", peek.XCTEST_RUNNER)
+        self.assertIn("-> Bool { true }", peek.XCTEST_NONE)
+
     def test_runner_runs_only_its_own_module(self):
         self.assertIn('arguments.filter = ["^\\(module)\\\\."]', peek.TEST_RUNNER_SOURCE)
 
