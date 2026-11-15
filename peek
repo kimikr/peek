@@ -29,7 +29,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 # Bumped whenever the app and this server stop understanding each other. The app sends its
 # number in X-Peek-Protocol (0.1.0 sends none, which means 1); a mismatch gets a clear reply.
 PROTOCOL = 2
