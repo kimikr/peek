@@ -218,7 +218,7 @@ class HotPatch(unittest.TestCase):
         return peek.patch_sources(self.BASE, new, "abc_ContentView.swift", 7)
 
     def test_body_edit_becomes_replacement(self):
-        source, count = self.patch(self.BASE.replace("count += 1", "count += 2"))
+        source, count, _ = self.patch(self.BASE.replace("count += 1", "count += 2"))
         self.assertEqual(count, 1)
         self.assertIn('@_private(sourceFile: "abc_ContentView.swift") import PeekPreview', source)
         self.assertIn("import SwiftUI", source)
@@ -227,14 +227,19 @@ class HotPatch(unittest.TestCase):
         self.assertIn("count += 2", source)
 
     def test_function_selector_and_defaults(self):
-        source, _ = self.patch(self.BASE.replace("String(value) + suffix", "suffix + String(value)"))
+        source, _, _ = self.patch(self.BASE.replace("String(value) + suffix", "suffix + String(value)"))
         self.assertIn("@_dynamicReplacement(for: label(for:_:))", source)
         self.assertIn("private func __peekr7_label(for value: Int, _ suffix: String) -> String", source)
 
     def test_constrained_extension_keeps_where(self):
-        source, _ = self.patch(self.BASE.replace("{ 2 }", "{ 3 }"))
+        source, _, _ = self.patch(self.BASE.replace("{ 2 }", "{ 3 }"))
         self.assertIn("extension ContentView where Self: Sendable {", source)
         self.assertIn("async throws -> Int", source)
+
+    def test_going_back_to_the_original_replaces_again(self):
+        source, count, replaced = peek.patch_sources(self.BASE, self.BASE, "abc_ContentView.swift", 8, {0})
+        self.assertEqual((count, replaced), (1, {0}))
+        self.assertIn("count += 1", source)
 
     def test_structural_edits_need_a_full_build(self):
         self.assertIsNone(self.patch(self.BASE.replace('title = "Hi"', 'title = "Ho"')))
@@ -242,7 +247,7 @@ class HotPatch(unittest.TestCase):
         self.assertIsNone(self.patch(self.BASE.replace("func label(for value", "func label(at value")))
 
     def test_comment_only_edit_outside_bodies_changes_nothing(self):
-        source, count = self.patch(self.BASE.replace("struct ContentView", "// hello\nstruct ContentView"))
+        source, count, _ = self.patch(self.BASE.replace("struct ContentView", "// hello\nstruct ContentView"))
         self.assertEqual(count, 0)
 
     def test_stored_property_right_before_body(self):
@@ -251,7 +256,7 @@ class HotPatch(unittest.TestCase):
                "    var body: some View { Text(\"x\") }\n}\n")
         _, members = peek.swift_members(src)
         self.assertEqual([(m["name"], m["prefix"]) for m in members], [("extra", "@ViewBuilder private"), ("body", "")])
-        source, count = peek.patch_sources(src, src.replace('Text("x")', 'Text("y")'), "f.swift", 1)
+        source, count, _ = peek.patch_sources(src, src.replace('Text("x")', 'Text("y")'), "f.swift", 1)
         self.assertEqual(count, 1)
         self.assertIn("@_dynamicReplacement(for: body)", source)
         self.assertNotIn("player", source)
