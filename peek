@@ -806,9 +806,31 @@ func __peekImage(_ name: String) -> SwiftUI.Image {
 
 # ------------------------------------------------------------------ package
 
+SWIFTPM_NOISE = re.compile(r"Building for debugging|Build complete!|\[Starting\]|\[Using on-disk description\]|"
+                           r"warning: argument unused during compilation|^\s*$|^\s*\[\d+ / \d+\]")
+
+
+def swiftpm_summary(lines):
+    """The lines of a SwiftPM build worth reading: no progress chatter, no repeated failures, and
+    not the full compiler command SwiftBuild prints under a failed step."""
+    out, in_command = [], False
+    for line in lines:
+        if re.match(r"error: (CompileC|CompileSwift|SwiftCompile|Ld|Libtool|SwiftDriver)\b", line):
+            out.append(line.split(" /", 1)[0] + " failed")
+            in_command = True
+            continue
+        if in_command and (line.startswith(" ") or not line.strip()):
+            continue
+        in_command = False
+        if not SWIFTPM_NOISE.search(line):
+            out.append(line)
+    return list(dict.fromkeys(out))  # SwiftBuild repeats a failure once per file
+
+
 def clean_swiftpm_line(line):
     """SwiftBuild prints failed commands with their whole environment (`env -i 'KEY=value' …`),
     which can hold secrets and would be shown on the phone: drop the variables."""
+    line = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line)  # clang's colours
     if "env -i" not in line:
         return line
     return re.sub(r"(?:'[A-Za-z_][A-Za-z0-9_]*=(?:[^']|'\\'')*' ?)+", "… ", line)
@@ -964,7 +986,7 @@ class Package:
             except (OSError, ValueError) as e:
                 output.append(f"error: {e}")
                 ok = False
-        output = list(dict.fromkeys(output))  # SwiftBuild repeats a failure once per file
+        output = swiftpm_summary(output)
         if not ok and any("actool" in l or "xcstringstool" in l for l in output):
             output.append("note: a dependency has an asset catalog or a string catalog; SwiftPM needs "
                           "Xcode's tools to build those, which only exist on a Mac.")
@@ -1648,7 +1670,9 @@ class Builder:
         affected by an edit. Each version is then linked into a library of its own.
         """
         started = time.time()
-        if self.is_package and not self.package:
+        if self.is_package and (not self.package or self.package_error):
+            # A failed dependency build leaves the previous objects behind; building on them
+            # would show a preview of code that no longer exists.
             return {"ok": False, "diagnostics": self.package_error or "Package.swift could not be read"}
         sources = self.sources()
         if not sources:
@@ -1753,8 +1777,6 @@ class Builder:
             output = (output + "\n" + self._clean(proc.stdout + proc.stderr, shown)).strip()
         elapsed = time.time() - started
         if proc.returncode != 0 or not dylib.exists():
-            if self.package_error:  # a dependency that failed explains the errors that follow
-                output = self.package_error + "\n\n" + output
             return {"ok": False, "diagnostics": output.strip() or "swiftc failed", "seconds": elapsed}
         self.base = {"version": version, "file": name, "snapshot": snapshot, "roots": roots,
                      "deps": deps[0] if deps else None, "resources": resources_key} if self.hot else None
@@ -2446,7 +2468,7 @@ class Hub:
             if ok:
                 log(f"dependencies ready ({time.time() - started:.1f}s)", "dim")
             else:
-                log(self.builder.package_error, "red")
+                log("building the dependencies failed (details below)", "red")
 
     def full_rebuild(self, reason):
         """Builds everything again (no patch), e.g. for a phone that does not have the base build."""

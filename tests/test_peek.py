@@ -347,6 +347,12 @@ class StringCatalogs(unittest.TestCase):
 
 
 class SwiftPMOutput(unittest.TestCase):
+    def test_failures_are_summarised(self):
+        lines = ["Building for debugging...", "[1 / 2] Shapes", "a.cpp:7:1: error: bad", "a.cpp:7:1: error: bad",
+                 "error: CompileC /x/a.o /x/a.cpp normal arm64", "    cd /x", "    /usr/bin/clang -x c++ ...",
+                 "error: Build failed"]
+        self.assertEqual(peek.swiftpm_summary(lines), ["a.cpp:7:1: error: bad", "error: CompileC failed", "error: Build failed"])
+
     def test_environment_is_not_shown(self):
         line = ("error: The command `(cd / && env -i 'A=1' 'TOKEN=se'\\''cret' 'LS_COLORS=rs=0:*.x=01' /p/actool --version)` "
                 "failed to launch.")
@@ -355,6 +361,7 @@ class SwiftPMOutput(unittest.TestCase):
         self.assertNotIn("TOKEN", cleaned)
         self.assertIn("env -i … /p/actool --version", cleaned)
         self.assertEqual(peek.clean_swiftpm_line("error: 'x' is 'y'"), "error: 'x' is 'y'")
+        self.assertEqual(peek.clean_swiftpm_line("\x1b[0;1;31merror: \x1b[0mbad"), "error: bad")
 
 
 class ReviewFixes(unittest.TestCase):
