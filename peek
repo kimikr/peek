@@ -806,6 +806,14 @@ func __peekImage(_ name: String) -> SwiftUI.Image {
 
 # ------------------------------------------------------------------ package
 
+def clean_swiftpm_line(line):
+    """SwiftBuild prints failed commands with their whole environment (`env -i 'KEY=value' …`),
+    which can hold secrets and would be shown on the phone: drop the variables."""
+    if "env -i" not in line:
+        return line
+    return re.sub(r"(?:'[A-Za-z_][A-Za-z0-9_]*=(?:[^']|'\\'')*' ?)+", "… ", line)
+
+
 class Package:
     """A SwiftPM package whose dependencies are built once by SwiftPM."""
 
@@ -940,8 +948,13 @@ class Package:
                 ok = False
         for extra in runs:
             proc = self.tc.swift_build(self.root, self.scratch, extra)
-            output += [l for l in (proc.stdout + proc.stderr).splitlines() if not re.fullmatch(r"\[\d+ / \d+\].*", l)]
+            output += [clean_swiftpm_line(l) for l in (proc.stdout + proc.stderr).splitlines()
+                       if not re.fullmatch(r"\[\d+ / \d+\].*", l)]
             ok = ok and proc.returncode == 0
+        output = list(dict.fromkeys(output))  # SwiftBuild repeats a failure once per file
+        if not ok and any("actool" in l or "xcstringstool" in l for l in output):
+            output.append("note: a dependency has an asset catalog or a string catalog; SwiftPM needs "
+                          "Xcode's tools to build those, which only exist on a Mac.")
         return ok, "\n".join(output).strip()
 
     @property

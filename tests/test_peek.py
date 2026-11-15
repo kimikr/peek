@@ -346,6 +346,17 @@ class StringCatalogs(unittest.TestCase):
             self.assertEqual((plural["one"], plural["other"], plural["NSStringFormatValueTypeKey"]), ("%lld item", "%lld items", "lld"))
 
 
+class SwiftPMOutput(unittest.TestCase):
+    def test_environment_is_not_shown(self):
+        line = ("error: The command `(cd / && env -i 'A=1' 'TOKEN=se'\\''cret' 'LS_COLORS=rs=0:*.x=01' /p/actool --version)` "
+                "failed to launch.")
+        cleaned = peek.clean_swiftpm_line(line)
+        self.assertNotIn("cret", cleaned)
+        self.assertNotIn("TOKEN", cleaned)
+        self.assertIn("env -i … /p/actool --version", cleaned)
+        self.assertEqual(peek.clean_swiftpm_line("error: 'x' is 'y'"), "error: 'x' is 'y'")
+
+
 class ReviewFixes(unittest.TestCase):
     def test_types_made_equatable_in_an_extension_keep_their_shape(self):
         sources = ["struct Row: View { var body: some View { Text(\"r\") } }\n",
