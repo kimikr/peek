@@ -32,6 +32,7 @@ VERSION = "0.2.0"
 # Bumped whenever the app and this server stop understanding each other. The app sends its
 # number in X-Peek-Protocol (0.1.0 sends none, which means 1); a mismatch gets a clear reply.
 PROTOCOL = 2
+MIN_IOS = (17, 0)  # the Peek app's deployment target
 STATE_DIR = Path(os.environ.get("PEEK_HOME", Path.home() / ".peek"))
 SKIP_DIRS = {".build", ".git", ".peek", "Tests", "xtool", "node_modules", ".swiftpm"}
 AUTH_WINDOW = 300  # seconds of clock skew tolerated on signed requests
@@ -1204,6 +1205,8 @@ def use_assets(src, images, colors):
     for kind, pattern, template in SYMBOL_CALLS:
         names = colors if kind == "color" else images
         symbols = {asset_symbol(n, "Color" if kind == "color" else "Image"): n for n in sorted(names, reverse=True)}
+        if kind == "color":  # Color(.red) also means Color(UIColor.red); leave it to the compiler
+            symbols = {k: v for k, v in symbols.items() if k and k.strip("`") not in SYSTEM_COLOR_NAMES}
         for m in pattern.finditer(src):
             name = symbols.get(m.group(1))
             if name is None or mask[m.start()] == " ":
@@ -1274,14 +1277,16 @@ class Builder:
 
     @property
     def ios(self):
-        if self.ios_override:
-            return self.ios_override
+        """The deployment target builds are compiled for: the project's, but at least iOS 17, which
+        the Peek app needs anyway (peek's own support code uses iOS 17 API)."""
+        version = self.ios_override
         manifest = self.root / "Package.swift"
-        if self.is_package and manifest.exists():
+        if not version and self.is_package and manifest.exists():
             m = re.search(r"\.iOS\(\s*(?:\.v(\d+)(?:_(\d+))?|\"([\d.]+)\")", manifest.read_text(errors="replace"))
             if m:
-                return m.group(3) or f"{m.group(1)}.{m.group(2) or 0}"
-        return "17.0"
+                version = m.group(3) or f"{m.group(1)}.{m.group(2) or 0}"
+        parts = tuple(int(p) for p in re.findall(r"\d+", version or "")[:3])
+        return version if parts >= MIN_IOS else ".".join(map(str, MIN_IOS))
 
     # -- inputs
 
@@ -1437,7 +1442,8 @@ class Builder:
             shutil.rmtree(members, ignore_errors=True)
             members.mkdir()
             inputs = [f for o in objects for f in unpack_object(o, members)]
-            cmd = [self.tc.swiftc, "-emit-library", *self._common_flags(), *self._link_flags(),
+            # libc++ for C++ in any dependency, remote packages included (their sources are not listed).
+            cmd = [self.tc.swiftc, "-emit-library", *self._common_flags(), *self._link_flags(), "-lc++",
                    "-Xlinker", "-install_name", "-Xlinker", f"@loader_path/{path.name}",
                    *map(str, inputs), "-o", str(path)]
             proc = subprocess.run(cmd, capture_output=True, text=True, cwd=self.out)
