@@ -861,13 +861,12 @@ class Package:
         # What the previewed target depends on directly, and where those sources live: an edit
         # there only needs these built, not the previewed target (peek compiles that itself).
         everything = {t["name"]: t for t in info["targets"]}
-        # Local macro targets are built for the host; binary targets cannot be built on their own,
-        # so peek unpacks those it needs itself (see stage_binaries).
         self.direct_targets = [t for t in target.get("target_dependencies") or [] if t in targets]
         # Macro targets cannot be built on their own (SwiftBuild has a host and a device copy of
         # each and refuses the name), so a package with local macros is built as a whole.
         self.local_macros = [n for n in needed | set(target.get("target_dependencies") or [])
                              if everything.get(n, {}).get("type") == "macro"]
+        # Binary targets cannot be built on their own, so peek unpacks those it needs (stage_binaries).
         self.binaries = {n: everything[n].get("path") for n in needed | set(target.get("target_dependencies") or [])
                          if everything.get(n, {}).get("type") == "binary"}
         # The previewed target's resources: peek assembles its bundle (SwiftPM would need actool
@@ -954,17 +953,17 @@ class Package:
                            if not re.fullmatch(r"\[\d+ / \d+\].*", l)]
                 output.append(f"error: macro {', '.join(missing)} could not be built")
                 ok = False
+        for extra in runs:
+            proc = self.tc.swift_build(self.root, self.scratch, extra)
+            output += [clean_swiftpm_line(l) for l in (proc.stdout + proc.stderr).splitlines()
+                       if not re.fullmatch(r"\[\d+ / \d+\].*", l)]
+            ok = ok and proc.returncode == 0
         if not dependencies_only:
             try:
                 self.stage_binaries()
             except (OSError, ValueError) as e:
                 output.append(f"error: {e}")
                 ok = False
-        for extra in runs:
-            proc = self.tc.swift_build(self.root, self.scratch, extra)
-            output += [clean_swiftpm_line(l) for l in (proc.stdout + proc.stderr).splitlines()
-                       if not re.fullmatch(r"\[\d+ / \d+\].*", l)]
-            ok = ok and proc.returncode == 0
         output = list(dict.fromkeys(output))  # SwiftBuild repeats a failure once per file
         if not ok and any("actool" in l or "xcstringstool" in l for l in output):
             output.append("note: a dependency has an asset catalog or a string catalog; SwiftPM needs "
@@ -989,7 +988,7 @@ class Package:
         return found[0]
 
     def stage_binaries(self):
-        """Unpacks the iOS device slice of each .xcframework the previewed target uses directly:
+        """Unpacks the iOS device slice of each .xcframework the previewed target needs:
         frameworks and static libraries into peek-binaries/, headers into peek-binaries/include/<name>."""
         shutil.rmtree(self.staged, ignore_errors=True)
         if not self.binaries:
@@ -1006,6 +1005,8 @@ class Package:
                 raise ValueError(f"{xcframework.name} has no iOS device (arm64) library")
             folder = xcframework / slice_["LibraryIdentifier"]
             library = folder / slice_["LibraryPath"]
+            if (self.products / library.name).exists():
+                continue  # a dependency uses it too, so SwiftPM has unpacked it already
             if library.is_dir():
                 shutil.copytree(library, self.staged / library.name, symlinks=True)
             else:
@@ -1023,8 +1024,9 @@ class Package:
     def objects(self):
         """Object files of the dependencies, plus static libraries from binary (.xcframework) targets."""
         built = {f"lib{name}.a" for name in self.product_names}
+        staged = {a.name for a in self.staged.glob("*.a")}  # SwiftPM may have copied the same library
         return [o for o in sorted(self.products.glob("*.o")) if o.stem not in self.excluded] + \
-            [a for a in sorted(self.products.glob("*.a")) if a.name not in built] + sorted(self.staged.glob("*.a"))
+            [a for a in sorted(self.products.glob("*.a")) if a.name not in built | staged] + sorted(self.staged.glob("*.a"))
 
     def frameworks(self):
         """Frameworks from binary (.xcframework) targets, static or dynamic."""
@@ -1325,7 +1327,7 @@ def string_catalog_files(catalog, out):
     """.strings and .stringsdict files for a string catalog (.xcstrings), which only Xcode compiles.
 
     Writes <out>/<lang>.lproj/<Table>.strings(dict) and yields (path inside the bundle, file).
-    Plural variations become .stringsdict entries; device variations use their "other" form."""
+    Plural variations become .stringsdict entries; device variations use the iPhone form."""
     try:
         data = json.loads(Path(catalog).read_text())
     except (OSError, ValueError):
