@@ -292,8 +292,11 @@ def _rewrite_app(src, mask, m, edits):
             if src[body:body + 1] == "(":
                 body = match_close(src, body) + 1
             edits.append((begin, body, "SwiftUI.Group" + _blank(src[begin:body])))
+        elif first and scene.group(1) == "DocumentGroup":
+            # A stand-in that opens one new, unsaved document (see SUPPORT_SOURCE).
+            edits.append((begin, begin + len("DocumentGroup"), "__PeekDocumentGroup"))
         elif first:
-            continue  # e.g. DocumentGroup: not supported, left as is
+            continue  # e.g. Window, Settings: not on iOS, left as is
         else:
             # Further windows, settings and other scenes are not shown.
             edits.append((begin, end, "SwiftUI.EmptyView()" + _blank(src[begin:end])))
@@ -663,6 +666,73 @@ struct __PeekGenerationRoot<Content: SwiftUI.View>: SwiftUI.View {
 @_cdecl("peek_bump")
 public func __peekBump() {
     MainActor.assumeIsolated { __PeekGeneration.shared.value += 1 }
+}
+
+// Stands in for DocumentGroup when the App is shown as a view: the editor gets one new,
+// unsaved document, through a configuration with the same members as SwiftUI's.
+struct __PeekFileConfiguration<Document: SwiftUI.FileDocument> {
+    @SwiftUI.Binding var document: Document
+    var fileURL: URL? { nil }
+    var isEditable: Bool { true }
+}
+
+struct __PeekReferenceConfiguration<Document: SwiftUI.ReferenceFileDocument> {
+    @SwiftUI.ObservedObject var document: Document
+    var fileURL: URL? { nil }
+    var isEditable: Bool { true }
+}
+
+struct __PeekDocumentGroup: SwiftUI.View {
+    private let content: SwiftUI.AnyView
+
+    init<D: SwiftUI.FileDocument, C: SwiftUI.View>(newDocument: @autoclosure @escaping () -> D,
+                                                   @SwiftUI.ViewBuilder editor: @escaping (__PeekFileConfiguration<D>) -> C) {
+        content = SwiftUI.AnyView(__PeekFileHolder(make: newDocument, editor: editor))
+    }
+
+    init<D: SwiftUI.ReferenceFileDocument, C: SwiftUI.View>(newDocument: @escaping () -> D,
+                                                            @SwiftUI.ViewBuilder editor: @escaping (__PeekReferenceConfiguration<D>) -> C) {
+        content = SwiftUI.AnyView(__PeekReferenceHolder(make: newDocument, editor: editor))
+    }
+
+    init<D: SwiftUI.FileDocument, C: SwiftUI.View>(viewing: D.Type,
+                                                   @SwiftUI.ViewBuilder viewer: @escaping (__PeekFileConfiguration<D>) -> C) {
+        content = SwiftUI.AnyView(__PeekNoDocument())
+    }
+
+    init<D: SwiftUI.ReferenceFileDocument, C: SwiftUI.View>(viewing: D.Type,
+                                                            @SwiftUI.ViewBuilder viewer: @escaping (__PeekReferenceConfiguration<D>) -> C) {
+        content = SwiftUI.AnyView(__PeekNoDocument())
+    }
+
+    var body: some SwiftUI.View { content }
+}
+
+struct __PeekFileHolder<D: SwiftUI.FileDocument, C: SwiftUI.View>: SwiftUI.View {
+    @SwiftUI.State private var document: D
+    let editor: (__PeekFileConfiguration<D>) -> C
+    init(make: () -> D, editor: @escaping (__PeekFileConfiguration<D>) -> C) {
+        _document = SwiftUI.State(initialValue: make())
+        self.editor = editor
+    }
+    var body: some SwiftUI.View { SwiftUI.NavigationStack { editor(__PeekFileConfiguration(document: $document)) } }
+}
+
+struct __PeekReferenceHolder<D: SwiftUI.ReferenceFileDocument, C: SwiftUI.View>: SwiftUI.View {
+    @SwiftUI.StateObject private var document: D
+    let editor: (__PeekReferenceConfiguration<D>) -> C
+    init(make: @escaping () -> D, editor: @escaping (__PeekReferenceConfiguration<D>) -> C) {
+        _document = SwiftUI.StateObject(wrappedValue: make())
+        self.editor = editor
+    }
+    var body: some SwiftUI.View { SwiftUI.NavigationStack { editor(__PeekReferenceConfiguration(document: document)) } }
+}
+
+struct __PeekNoDocument: SwiftUI.View {
+    var body: some SwiftUI.View {
+        SwiftUI.ContentUnavailableView("No document", systemImage: "doc",
+                                       description: SwiftUI.Text("A viewer-only DocumentGroup needs a document; preview it with #Preview instead."))
+    }
 }
 
 // Scene modifiers have no meaning on a view; accept and ignore them.

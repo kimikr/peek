@@ -116,10 +116,10 @@ class Rewrite(unittest.TestCase):
         self.assertIn("Settings()", new)
         self.assertNotIn("EmptyView", new)
 
-    def test_document_group_is_left_alone(self):
+    def test_document_group_gets_a_stand_in(self):
         src = "@main struct A: App {\n    var body: some Scene {\n        DocumentGroup(newDocument: D()) { f in V(f) }\n    }\n}\n"
         new, _, _ = self.check_lines(src)
-        self.assertIn("DocumentGroup(newDocument: D())", new)
+        self.assertIn("__PeekDocumentGroup(newDocument: D()) { f in V(f) }", new)
 
 
 class Crypto(unittest.TestCase):
