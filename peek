@@ -834,6 +834,112 @@ def walk_files(base, skip=None):
                 yield path
 
 
+def _color_component(value):
+    value = str(value).strip()
+    if value.lower().startswith("0x"):
+        return int(value, 16) / 255
+    if "." in value:
+        return float(value)
+    number = float(value)
+    return number / 255 if number > 1 else number
+
+
+def asset_colors(catalogs):
+    """Colour sets of asset catalogs as {name: {"any": spec, "dark": spec}}.
+
+    A spec is ("srgb" | "display-p3", red, green, blue, alpha) or ("system", selector name).
+    """
+    colors = {}
+    for catalog in catalogs:
+        for colorset in sorted(catalog.rglob("*.colorset")):
+            try:
+                entries = json.loads((colorset / "Contents.json").read_text()).get("colors", [])
+            except (OSError, ValueError):
+                continue
+            found = {}
+            for entry in entries:
+                color = entry.get("color") or {}
+                if entry.get("idiom", "universal") not in ("universal", "iphone") or \
+                        color.get("platform", "ios") not in ("ios", "universal"):
+                    continue
+                appearances = entry.get("appearances") or []
+                if any(a.get("appearance") != "luminosity" for a in appearances):
+                    continue  # high contrast variants
+                look = "dark" if any(a.get("value") == "dark" for a in appearances) else \
+                    "light" if appearances else "any"
+                try:
+                    if color.get("reference"):
+                        spec = ("system", color["reference"])
+                    else:
+                        c = color.get("components", {})
+                        spec = (color.get("color-space", "srgb"), *(_color_component(c.get(k, "1" if k == "alpha" else "0"))
+                                                                    for k in ("red", "green", "blue", "alpha")))
+                except ValueError:
+                    continue
+                found[look] = spec
+            if "light" in found and "any" not in found:
+                found["any"] = found.pop("light")
+            if "any" in found:
+                colors[colorset.stem] = found
+    return colors
+
+
+def _uicolor(spec):
+    if spec[0] == "system":
+        return (f'((UIColor.self as AnyObject).perform(NSSelectorFromString({json.dumps(spec[1])}))?'
+                f'.takeUnretainedValue() as? UIColor ?? .clear)')
+    kind, r, g, b, a = spec
+    if kind == "display-p3":
+        return f"UIColor(displayP3Red: {r:.4f}, green: {g:.4f}, blue: {b:.4f}, alpha: {a:.4f})"
+    return f"UIColor(red: {r:.4f}, green: {g:.4f}, blue: {b:.4f}, alpha: {a:.4f})"
+
+
+def colors_source(colors):
+    """Swift code standing in for the colour sets that only an asset catalog compiler could provide."""
+    cases = []
+    for name, looks in sorted(colors.items()):
+        value = _uicolor(looks["any"])
+        if "dark" in looks:
+            value = (f"UIColor {{ $0.userInterfaceStyle == .dark ? {_uicolor(looks['dark'])} : {value} }}")
+        cases.append(f"    case {json.dumps(name)}: return {value}")
+    return ("\n// Colour sets from the asset catalogs (Assets.car cannot be compiled without a Mac).\n"
+            "func __peekUIColor(_ name: String) -> UIColor? {\n    switch name {\n" + "\n".join(cases)
+            + "\n    default: return nil\n    }\n}\n\n"
+            "func __peekColor(_ name: String) -> SwiftUI.Color {\n"
+            "    SwiftUI.Color(uiColor: __peekUIColor(name) ?? .clear)\n}\n")
+
+
+_STR = r'"((?:[^"\\\n]|\\.)*)"'
+_ARG = r"[^()\n]*?(?:\([^()\n]*\))?"
+ASSET_CALLS = [
+    ("color", re.compile(rf"\b(?:SwiftUI\.)?Color\([ \t]*{_STR}[ \t]*(?:,[ \t]*bundle:{_ARG}[ \t]*)?\)"), '__peekColor("{}")'),
+    ("color", re.compile(rf"\bUIColor\([ \t]*named:[ \t]*{_STR}[ \t]*(?:,[ \t]*in:{_ARG},[ \t]*compatibleWith:{_ARG}[ \t]*)?\)"),
+     '__peekUIColor("{}")'),
+    ("image", re.compile(rf"\b((?:SwiftUI\.)?Image)\([ \t]*{_STR}[ \t]*\)"), None),
+    ("image", re.compile(rf"\bUIImage\([ \t]*named:[ \t]*{_STR}[ \t]*\)"), 'UIImage(named: "{}", in: .module, with: nil)'),
+]
+
+
+def use_assets(src, images, colors):
+    """Points asset lookups by name at what peek ships instead of a compiled asset catalog."""
+    mask = code_mask(src)
+    edits = []
+    for kind, pattern, template in ASSET_CALLS:
+        names = colors if kind == "color" else images
+        for m in pattern.finditer(src):
+            name = m.group(m.lastindex)
+            if name not in names or mask[m.start()] == " ":
+                continue  # unknown name, or inside a comment or string
+            if template is None:
+                text = f'{m.group(1)}("{name}", bundle: .module)'
+            else:
+                text = template.format(name)
+            edits.append((m.start(), m.end(), text))
+    for start, end, text in sorted(edits, reverse=True):
+        src = src[:start] + text + src[end:]
+    return src
+
+
 def flatten_asset_catalog(catalog):
     """Loose files for the image sets of an .xcassets folder (compiling Assets.car needs a Mac).
 
@@ -890,6 +996,7 @@ class Builder:
         self.is_package = not self.single and (self.root / "Package.swift").exists()
         self.package = None
         self.package_error = None
+        self.colors, self.images = {}, set()
 
     @property
     def ios(self):
@@ -931,7 +1038,7 @@ class Builder:
             name = "PeekResources"
             base = self.source_dir()
             for folder in sorted(p for p in base.rglob("Resources") if p.is_dir()):
-                for path in walk_files(folder, skip=lambda p: ".xcassets" in p.parts):
+                for path in walk_files(folder, skip=lambda p: any(part.endswith(".xcassets") for part in p.parts)):
                     files.append((f"{name}.bundle/{path.name}", path))
             catalogs = sorted(base.rglob("*.xcassets"))
         else:
@@ -939,11 +1046,16 @@ class Builder:
         for catalog in catalogs:
             for filename, path in flatten_asset_catalog(catalog):
                 files.append((f"{name}.bundle/{filename}", path))
+        self.colors = asset_colors(catalogs)
         unique = {}
         for arcname, path in files:
             unique.setdefault(arcname, path)
         if not unique and not (self.package and self.package.bundle_name):
             name = None
+        # Image names that `Image("name")` should find in that bundle.
+        self.images = {re.sub(r"@\dx$", "", Path(a).stem) for a in unique
+                       if name and a.startswith(f"{name}.bundle/") and a.count("/") == 1
+                       and Path(a).suffix.lower() in (".png", ".jpg", ".jpeg", ".pdf", ".heic", ".gif")}
         return name, sorted(unique.items())
 
     @staticmethod
@@ -1067,11 +1179,13 @@ class Builder:
         srcdir.mkdir(parents=True, exist_ok=True)
         objdir.mkdir(exist_ok=True)
         roots, inputs, structs, app = [], [], [], None
+        bundle_name, resources = self.resources()
         for path in sources:
             shown = path.name if self.single else str(path.relative_to(self.root))
             tag = hashlib.sha1(shown.encode()).hexdigest()[:8]
             text = path.read_text(errors="replace")
             new, found, app_struct = rewrite_source(text, tag)
+            new = use_assets(new, self.images if bundle_name else set(), self.colors)
             roots += found
             app = app or app_struct
             structs += VIEW_STRUCT_RE.findall(code_mask(text))
@@ -1094,9 +1208,9 @@ class Builder:
         body = "\n".join(
             f"        case {i}: return UIHostingController(rootView: AnyView(__PeekGenerationRoot(content: AnyView({expr}))))"
             for i, (expr, _) in enumerate(cases))
-        bundle_name, resources = self.resources()
         support, entry = srcdir / "__PeekSupport.swift", srcdir / "__PeekEntry.swift"
-        write_if_changed(support, SUPPORT_SOURCE + (BUNDLE_TEMPLATE.replace("%NAME%", bundle_name) if bundle_name else ""))
+        write_if_changed(support, SUPPORT_SOURCE + (BUNDLE_TEMPLATE.replace("%NAME%", bundle_name) if bundle_name else "")
+                         + colors_source(self.colors))
         write_if_changed(entry, ENTRY_TEMPLATE.replace("%CASES%", body))
         files = [c for c, _ in inputs] + [support, entry]
         for stale in srcdir.glob("*.swift"):

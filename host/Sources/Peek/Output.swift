@@ -11,6 +11,8 @@ final class Output {
     private var sent: UInt64 = 0
     private var pending = ""
     private var leftover: String?
+    /// The end of what the last run printed before Peek quit, to show on the crash screen.
+    private(set) var lastWords: String?
     private weak var session: Session?
     private var timer: Timer?
 
@@ -22,6 +24,7 @@ final class Output {
             try? handle.seek(toOffset: offset)
             if let data = try? handle.readToEnd(), !data.isEmpty {
                 leftover = String(decoding: data, as: UTF8.self)
+                lastWords = String(leftover!.suffix(4000)).trimmingCharacters(in: .whitespacesAndNewlines)
             }
             try? handle.close()
         }

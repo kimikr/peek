@@ -87,9 +87,20 @@ private struct StatusView: View {
             case .crashedLastTime:
                 Image(systemName: "bolt.trianglebadge.exclamationmark").font(.largeTitle).foregroundStyle(.orange)
                 Text("The last build quit the app").font(.title3.bold())
-                Text("Peek closed while loading this build, so it was not loaded again. Save a change to send a new build, or try this one again.")
+                Text("Peek closed while loading this build, so it was not loaded again. Save a change to send a new build (it loads by itself), or try this one again.")
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
+                if let words = session.crashOutput, !words.isEmpty {
+                    ScrollView {
+                        Text(words)
+                            .font(.system(size: 11, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 200)
+                    .padding(8)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+                }
                 Button("Load it anyway") { session.retryCrashedBuild() }
                     .buttonStyle(.bordered)
             case .building:

@@ -252,6 +252,33 @@ class HotPatch(unittest.TestCase):
         self.assertNotIn("Equatable { @SwiftUI.Environment", new)
 
 
+class Assets(unittest.TestCase):
+    def test_colour_sets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            colorset = Path(tmp) / "A.xcassets" / "Brand.colorset"
+            colorset.mkdir(parents=True)
+            (colorset / "Contents.json").write_text(json.dumps({"colors": [
+                {"idiom": "universal", "color": {"color-space": "srgb",
+                 "components": {"red": "0xFF", "green": "128", "blue": "0.250", "alpha": "1.000"}}},
+                {"idiom": "universal", "appearances": [{"appearance": "luminosity", "value": "dark"}],
+                 "color": {"platform": "ios", "reference": "systemBlueColor"}},
+                {"idiom": "universal", "appearances": [{"appearance": "contrast", "value": "high"}],
+                 "color": {"components": {"red": "0", "green": "0", "blue": "0", "alpha": "1"}}}]}))
+            colors = peek.asset_colors([Path(tmp) / "A.xcassets"])
+        self.assertEqual(colors["Brand"]["any"], ("srgb", 1.0, 128 / 255, 0.25, 1.0))
+        self.assertEqual(colors["Brand"]["dark"], ("system", "systemBlueColor"))
+        source = peek.colors_source(colors)
+        self.assertIn('case "Brand": return UIColor { $0.userInterfaceStyle == .dark ?', source)
+
+    def test_lookups_by_name_are_rewritten(self):
+        src = ('Image("Logo"); Color("Brand"); Color("Brand", bundle: .main); UIColor(named: "Brand")\n'
+               'Image("Other"); Color("Nope") // Image("Logo")\nlet s = "Color(\\"Brand\\")"\n')
+        out = peek.use_assets(src, {"Logo"}, {"Brand": {}})
+        self.assertIn('Image("Logo", bundle: .module); __peekColor("Brand"); __peekColor("Brand"); __peekUIColor("Brand")', out)
+        self.assertIn('Image("Other"); Color("Nope") // Image("Logo")', out)
+        self.assertIn('let s = "Color(\\"Brand\\")"', out)
+
+
 class PackageEdits(unittest.TestCase):
     def test_only_dependency_sources(self):
         package = peek.Package.__new__(peek.Package)

@@ -102,6 +102,8 @@ final class Session {
     private var discovered: [String] = []
     private var lastShot = 0
     private let output = Output()
+    /// What the crashed build printed last (a fatalError message, typically).
+    var crashOutput: String? { output.lastWords }
     private let discovery = Discovery()
     private let defaults = UserDefaults.standard
     private let http: URLSession = {
