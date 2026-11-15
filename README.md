@@ -259,7 +259,8 @@ in the link is used. Pair with `peek link --qr` at any time.
 | Builds on Linux: examples, three real apps, UIKit previews, App rewriting | ✅ |
 | Server test suite (`python3 -m unittest discover tests`) | ✅ |
 | On that phone: encrypted protocol, incremental reload, dependency library, `print()` output, `peek shot`, light/dark and text size | ✅ |
-| 0.2 on a device: hot patching (state kept), C/Objective-C and `.xcframework` dependencies, colour sets, `DocumentGroup` | ⏳ built and tested on Linux only so far |
+| 0.2 on that phone: hot patching keeps `@State` across body edits, chained patches, closure changes, fallback to a full build | ✅ |
+| 0.2 C/Objective-C and `.xcframework` dependencies, colour sets, `DocumentGroup` | ✅ built on Linux; ⏳ not yet run on a device |
 | Peek installed directly with SideStore / AltStore | ⏳ not yet |
 | Bonjour discovery on a real Wi-Fi network | ⏳ not yet |
 
