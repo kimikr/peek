@@ -295,6 +295,30 @@ class Assets(unittest.TestCase):
         self.assertIn('let s = "Color(\\"Brand\\")"', out)
 
 
+class AssetSymbols(unittest.TestCase):
+    def test_names_follow_xcode(self):
+        cases = {("brand-primary", "Color"): "brandPrimary", ("AccentColor", "Color"): "accent",
+                 ("URLIcon", "Image"): "urlIcon", ("app logo", "Image"): "appLogo", ("3d", "Image"): "_3d",
+                 ("default", "Color"): "`default`", ("Color", "Color"): "color", ("logo-image", "Image"): "logo"}
+        for (name, suffix), symbol in cases.items():
+            self.assertEqual(peek.asset_symbol(name, suffix), symbol, name)
+
+    def test_source_overrides_resource_initialisers(self):
+        src = peek.asset_symbols_source({"BrandColor": {}, "red": {}}, {"app-logo"}, True)
+        self.assertIn('static let brand = DeveloperToolsSupport.ColorResource(name: "BrandColor", bundle: Foundation.Bundle.module)', src)
+        self.assertIn('static let appLogo = DeveloperToolsSupport.ImageResource(name: "app-logo"', src)
+        self.assertIn("init(_ resource: DeveloperToolsSupport.ColorResource)", src)
+        self.assertIn('static var brand: SwiftUI.Color { __peekColor("BrandColor") }', src)
+        self.assertNotIn("static var red:", src)  # SwiftUI has Color.red
+        self.assertEqual(peek.asset_symbols_source({}, {"logo"}, False), "")
+
+    def test_symbol_lookups_are_rewritten(self):
+        src = 'Color(.brand); Image(.appLogo); UIColor(resource: .brand); Color(.red); Image(.other) // Color(.brand)\n'
+        out = peek.use_assets(src, {"app-logo"}, {"BrandColor": {}})
+        self.assertIn('__peekColor("BrandColor"); Image("app-logo", bundle: .module); (__peekUIColor("BrandColor") ?? .clear); '
+                      'Color(.red); Image(.other) // Color(.brand)', out)
+
+
 class ReviewFixes(unittest.TestCase):
     def test_types_made_equatable_in_an_extension_keep_their_shape(self):
         sources = ["struct Row: View { var body: some View { Text(\"r\") } }\n",
