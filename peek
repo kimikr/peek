@@ -227,12 +227,25 @@ PREVIEW_RE = re.compile(r"#Preview\b")
 MAIN_RE = re.compile(r"@main\b")
 APP_RE = re.compile(r"@main\s+(?:\w+\s+)*?struct\s+(\w+)\s*:\s*([^{]*)\{")
 VIEW_STRUCT_RE = re.compile(r"\bstruct\s+(\w+)\s*(?:<[^>{]*>)?\s*:\s*[^{]*\bView\b[^{]*\{")
+# Structs that can read the environment and should re-render after a hot patch.
+REFRESHABLE_STRUCT_RE = re.compile(r"\bstruct\s+(\w+)\s*(?:<[^>{]*>)?\s*:\s*[^{]*\b(?:View|ViewModifier)\b[^{]*\{")
 SCENE_RE = re.compile(r"\b(WindowGroup|Window|DocumentGroup|Settings|MenuBarExtra|ImmersiveSpace|UtilityWindow)\b")
 
 
 GENERATION_PROPERTY = " @SwiftUI.Environment(\\.__peekGeneration) private var __peekGeneration;"
 # Synthesized conformances that a hidden Environment property would break.
 SYNTHESIZED_RE = re.compile(r"\b(Equatable|Hashable|Codable|Encodable|Decodable|Comparable)\b")
+SYNTHESIZED_EXTENSION_RE = re.compile(r"\bextension\s+([A-Za-z_][\w.]*)\s*(?:<[^>{]*>)?\s*:\s*[^{]*?"
+                                      r"\b(?:Equatable|Hashable|Codable|Encodable|Decodable|Comparable)\b[^{]*\{")
+
+
+def synthesized_elsewhere(sources):
+    """Types that get a synthesized conformance in an extension (in any of these sources)."""
+    names = set()
+    for text in sources:
+        for m in SYNTHESIZED_EXTENSION_RE.finditer(code_mask(text)):
+            names.add(m.group(1).split(".")[-1])
+    return names
 
 
 def _blank(text):
@@ -347,7 +360,7 @@ def _rewrite_preview(src, m, name):
     return m.start(), close + 1, head + "\n".join(lines) + "} } }", title
 
 
-def rewrite_source(src, tag="0"):
+def rewrite_source(src, tag="0", keep_shape=frozenset()):
     """Makes a source file previewable without changing its line numbers.
 
     - each `#Preview { ... }` becomes a view struct `__PeekRoot_<tag>_<n>` the entry point can show
@@ -373,8 +386,8 @@ def rewrite_source(src, tag="0"):
             spans.append((start, end))
             roots.append((name, title))
     # Every View struct reads the hot-patch generation, so a patch can make it re-render.
-    for m in VIEW_STRUCT_RE.finditer(mask):
-        if SYNTHESIZED_RE.search(m.group(0)) or any(a <= m.start() < b for a, b in spans):
+    for m in REFRESHABLE_STRUCT_RE.finditer(mask):
+        if SYNTHESIZED_RE.search(m.group(0)) or m.group(1) in keep_shape or any(a <= m.start() < b for a, b in spans):
             continue
         edits.append((m.end(), m.end(), GENERATION_PROPERTY))
     if app:
@@ -903,8 +916,24 @@ class Package:
             [a for a in sorted(self.products.glob("*.a")) if a.name not in built]
 
     def frameworks(self):
-        """Dynamic frameworks from binary (.xcframework) targets: shipped to the phone as they are."""
+        """Frameworks from binary (.xcframework) targets, static or dynamic."""
         return sorted(f for f in self.products.glob("*.framework") if f.is_dir())
+
+    def dynamic_frameworks(self):
+        """The frameworks whose binary is a dynamic library: signed and shipped to the phone.
+
+        A static framework holds an `ar` archive; it is linked into the builds instead."""
+        found = []
+        for framework in self.frameworks():
+            binary = framework / framework.stem
+            try:
+                with open(binary, "rb") as f:
+                    static = f.read(8) == b"!<arch>\n"
+            except OSError:
+                continue
+            if not static:
+                found.append(framework)
+        return found
 
     def module_maps(self):
         """-Xcc -fmodule-map-file flags for the C, Objective-C and C++ targets SwiftPM built.
@@ -1235,9 +1264,10 @@ class Builder:
         if self.tc.runtime:  # provides __isPlatformVersionAtLeast for `if #available`
             cmd += ["-Xlinker", str(self.tc.runtime)]
         if self.package and self.package.frameworks():
-            # The phone puts dynamic frameworks in Frameworks/ next to the builds.
-            cmd += ["-Xlinker", "-rpath", "-Xlinker", "@loader_path/Frameworks"]
             cmd += [a for f in self.package.frameworks() for a in ("-framework", f.stem)]
+            if self.package.dynamic_frameworks():
+                # The phone puts dynamic frameworks in Frameworks/ next to the builds.
+                cmd += ["-Xlinker", "-rpath", "-Xlinker", "@loader_path/Frameworks"]
         return cmd + (self.package.link_flags if self.package else [])
 
     @staticmethod
@@ -1297,11 +1327,13 @@ class Builder:
         objdir.mkdir(exist_ok=True)
         roots, inputs, structs, app = [], [], [], None
         bundle_name, resources = self.resources()
+        texts = {path: path.read_text(errors="replace") for path in sources}
+        keep_shape = synthesized_elsewhere(texts.values())
         for path in sources:
             shown = path.name if self.single else str(path.relative_to(self.root))
             tag = hashlib.sha1(shown.encode()).hexdigest()[:8]
-            text = path.read_text(errors="replace")
-            new, found, app_struct = rewrite_source(text, tag)
+            text = texts[path]
+            new, found, app_struct = rewrite_source(text, tag, keep_shape)
             new = use_assets(new, self.images if bundle_name else set(), self.colors)
             roots += found
             app = app or app_struct
@@ -1345,9 +1377,11 @@ class Builder:
 
         if self.hot and self.base and not self.force_full:
             patch = self._patch(version, snapshot, deps, resources_key, language, shown)
+            if patch and patch.get("noop"):
+                return patch
             if patch:
                 patch.update(roots=self.base["roots"], resources=resources, deps=deps,
-                             frameworks=self.package.frameworks() if self.package else [],
+                             frameworks=self.package.dynamic_frameworks() if self.package else [],
                              seconds=time.time() - started)
                 return patch
 
@@ -1391,7 +1425,7 @@ class Builder:
                      "deps": deps[0] if deps else None, "resources": resources_key} if self.hot else None
         self._clean_old_builds(keep={dylib})
         return {"ok": True, "dylib": dylib, "file": name, "roots": roots, "seconds": elapsed,
-                "resources": resources, "deps": deps, "frameworks": self.package.frameworks() if self.package else []}
+                "resources": resources, "deps": deps, "frameworks": self.package.dynamic_frameworks() if self.package else []}
 
     def _package_flags(self):
         if not self.package:
@@ -1425,7 +1459,7 @@ class Builder:
                 sources.append(made[0])
                 replaced[f] = made[2]
         if not sources:
-            return None
+            return {"ok": True, "noop": True}  # only comments or formatting changed
         folder = self.out / "patch"
         shutil.rmtree(folder, ignore_errors=True)
         folder.mkdir()
@@ -2111,6 +2145,9 @@ class Hub:
         if self.builder.patch_error:
             log("hot patch not possible, built everything instead", "dim")
             self.builder.patch_error = None
+        if result.get("noop"):
+            log("no code changed (comments or formatting): nothing to reload", "dim")
+            return
         if not result["ok"]:
             log(f"build failed ({result.get('seconds', 0):.1f}s)", "red")
             print(result["diagnostics"], flush=True)
@@ -2462,7 +2499,7 @@ def cmd_dev(args):
     token = load_token()
     builder = Builder(args, tc)
     hub = Hub(builder, Signer(tc), token)
-    hosts = args.host or local_addresses()
+    hosts = args.host or ([args.bind] if args.bind and args.bind != "0.0.0.0" else local_addresses())
     # Listen on the advertised addresses and on loopback (for `peek shot`) only.
     if args.bind:
         binds = [args.bind]

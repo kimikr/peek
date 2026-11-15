@@ -295,6 +295,31 @@ class Assets(unittest.TestCase):
         self.assertIn('let s = "Color(\\"Brand\\")"', out)
 
 
+class ReviewFixes(unittest.TestCase):
+    def test_types_made_equatable_in_an_extension_keep_their_shape(self):
+        sources = ["struct Row: View { var body: some View { Text(\"r\") } }\n",
+                   "extension Row: Equatable {}\nextension Other: Codable where T: Codable {}\n"]
+        keep = peek.synthesized_elsewhere(sources)
+        self.assertEqual(keep, {"Row", "Other"})
+        new, _, _ = peek.rewrite_source(sources[0], "t", keep)
+        self.assertNotIn("__peekGeneration", new)
+
+    def test_view_modifiers_refresh_too(self):
+        new, _, _ = peek.rewrite_source("struct Bold: ViewModifier {\n func body(content: Content) -> some View { content }\n}\n")
+        self.assertIn("ViewModifier { @SwiftUI.Environment", new)
+
+    def test_static_frameworks_are_not_shipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            products = Path(tmp)
+            for name, head in (("Stat", b"!<arch>\nxxxx"), ("Dyn", b"\xcf\xfa\xed\xfexxxx")):
+                (products / f"{name}.framework").mkdir()
+                (products / f"{name}.framework" / name).write_bytes(head)
+            package = peek.Package.__new__(peek.Package)
+            package.products = products
+            self.assertEqual([f.name for f in package.frameworks()], ["Dyn.framework", "Stat.framework"])
+            self.assertEqual([f.name for f in package.dynamic_frameworks()], ["Dyn.framework"])
+
+
 class PackageEdits(unittest.TestCase):
     def test_only_dependency_sources(self):
         package = peek.Package.__new__(peek.Package)
