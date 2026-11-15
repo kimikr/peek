@@ -245,6 +245,17 @@ class HotPatch(unittest.TestCase):
         source, count = self.patch(self.BASE.replace("struct ContentView", "// hello\nstruct ContentView"))
         self.assertEqual(count, 0)
 
+    def test_stored_property_right_before_body(self):
+        src = ("struct V: View {\n    @Environment(Player.self) private var player: Player\n"
+               "    @ViewBuilder private var extra: some View { Text(\"a\") }\n"
+               "    var body: some View { Text(\"x\") }\n}\n")
+        _, members = peek.swift_members(src)
+        self.assertEqual([(m["name"], m["prefix"]) for m in members], [("extra", "@ViewBuilder private"), ("body", "")])
+        source, count = peek.patch_sources(src, src.replace('Text("x")', 'Text("y")'), "f.swift", 1)
+        self.assertEqual(count, 1)
+        self.assertIn("@_dynamicReplacement(for: body)", source)
+        self.assertNotIn("player", source)
+
     def test_views_read_the_generation(self):
         new, _, _ = peek.rewrite_source("struct A: View {\n var body: some View { Text(\"a\") }\n}\n"
                                         "struct B: View, Equatable {\n var body: some View { Text(\"b\") }\n}\n")

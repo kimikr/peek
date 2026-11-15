@@ -403,6 +403,7 @@ _MODIFIER = (r"(?:@[A-Za-z_][\w.]*(?:\((?:[^()]|\([^()]*\))*\))?"
 _PREFIX_RE = re.compile(rf"(?:{_MODIFIER}\s*)*$")
 _FUNC_RE = re.compile(r"\bfunc\s+([^\s(<]+)")
 _VAR_RE = re.compile(r"\bvar\s+([A-Za-z_]\w*)\s*:([^=]+?)\s*$", re.S)
+_DECL_KEYWORD_RE = re.compile(r"\b(func|var|let|init|deinit|subscript|case|struct|class|enum|extension|actor|protocol|typealias)\b")
 _TYPE_RE = re.compile(r"\b(struct|class|enum|extension|actor|protocol)\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)")
 _IMPORT_RE = re.compile(r"^[ \t]*(?:@[\w]+(?:\([^)\n]*\))?\s+)*import\s+(?:(?:struct|class|enum|protocol|func|var|typealias)\s+)?[\w.]+[ \t]*$", re.M)
 _DROPPED = {"private", "fileprivate", "internal", "public", "open", "package", "override", "final", "dynamic",
@@ -446,12 +447,24 @@ def swift_members(src):
             if close < 0 or close >= end:
                 return
             head_start = max(start, *(mask.rfind(c, start, j) + 1 for c in ";{}"))
+            # Earlier declarations without a body (stored properties, cases) can share the header
+            # text; the brace belongs to the last declaration keyword before it.
+            keywords = list(_DECL_KEYWORD_RE.finditer(mask, head_start, j))
+            if keywords:
+                last = keywords[-1].group(1)
+                if last in ("func", "var"):
+                    # the declaration starts at the attributes and modifiers right before it
+                    lead = _PREFIX_RE.search(mask, head_start, keywords[-1].start())
+                    head_start = lead.start() if lead else keywords[-1].start()
             header = mask[head_start:j]
-            func, var, typ = _FUNC_RE.search(header), None, None
-            if not func and not re.search(r"\b(init|deinit|subscript)\b", header):
+            func, var, typ = None, None, None
+            last = keywords[-1].group(1) if keywords else None
+            if last == "func":
+                func = _FUNC_RE.search(header)
+            elif last == "var":
                 var = _VAR_RE.search(header)
-                if not var:
-                    typ = _TYPE_RE.search(header)
+            elif last in ("struct", "class", "enum", "extension", "actor", "protocol"):
+                typ = _TYPE_RE.search(header)
             keyword = func or var
             if keyword:
                 prefix = _PREFIX_RE.search(header[:keyword.start()])
