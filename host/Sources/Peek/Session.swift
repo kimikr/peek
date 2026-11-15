@@ -29,6 +29,7 @@ struct ServerState: Decodable, Equatable {
     var seconds: Double?
     var resources: Resources?
     var deps: Resources?  // the package's dependencies, linked once into a library of their own
+    var frameworks: Resources?  // dynamic frameworks from .xcframework dependencies, signed
     var shot: Int?  // screenshot requests so far (`peek shot`)
     var peek: String?
     var file: String?  // the name the build must be saved under (patches refer to their base by it)
@@ -420,6 +421,17 @@ final class Session {
             .appendingPathComponent("builds", isDirectory: true)
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            if let frameworks = state.frameworks {
+                // Builds find them through the rpath @loader_path/Frameworks.
+                let folder = directory.appendingPathComponent("Frameworks", isDirectory: true)
+                let marker = folder.appendingPathComponent(".peek-\(frameworks.id)")
+                if !FileManager.default.fileExists(atPath: marker.path) {
+                    let (data, response) = try await request("GET", "/v1/frameworks/\(frameworks.id)", timeout: 120)
+                    guard response.statusCode == 200 else { return }
+                    try ResourceArchive.unpack(data, into: folder)
+                    FileManager.default.createFile(atPath: marker.path, contents: nil)
+                }
+            }
             if let deps = state.deps {
                 // The build refers to it as @loader_path/PeekDeps-<id>.dylib, so it goes next to it.
                 let file = directory.appendingPathComponent("PeekDeps-\(deps.id).dylib")

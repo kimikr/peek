@@ -783,6 +783,7 @@ class Package:
             m = re.search(r"^product:\s*(\S+)", (root / "xtool.yml").read_text(), re.M)
             wanted = m.group(1) if m else None
         products = {p["name"]: p["targets"] for p in info.get("products", [])}
+        self.product_names = set(products)
         if wanted and wanted not in targets:
             wanted = next((t for t in products.get(wanted, []) if t in targets), wanted)
         if not wanted:
@@ -876,7 +877,25 @@ class Package:
         return bool(paths) and all(p.suffix == ".swift" and any(d in p.parents for d in self.dep_dirs) for p in paths)
 
     def objects(self):
-        return [o for o in sorted(self.products.glob("*.o")) if o.stem not in self.excluded]
+        """Object files of the dependencies, plus static libraries from binary (.xcframework) targets."""
+        built = {f"lib{name}.a" for name in self.product_names}
+        return [o for o in sorted(self.products.glob("*.o")) if o.stem not in self.excluded] + \
+            [a for a in sorted(self.products.glob("*.a")) if a.name not in built]
+
+    def frameworks(self):
+        """Dynamic frameworks from binary (.xcframework) targets: shipped to the phone as they are."""
+        return sorted(f for f in self.products.glob("*.framework") if f.is_dir())
+
+    def module_maps(self):
+        """-Xcc -fmodule-map-file flags for the C, Objective-C and C++ targets SwiftPM built.
+
+        SwiftPM writes a module map per target; Swift code imports those modules through them."""
+        folder = self.scratch / "out/Intermediates.noindex/GeneratedModuleMaps-iphoneos"
+        flags = []
+        for path in sorted(folder.glob("*.modulemap")):
+            if path.stem not in self.excluded:  # the previewed target's own (Swift) module
+                flags += ["-Xcc", f"-fmodule-map-file={path}"]
+        return flags
 
     def macro_plugins(self):
         """-load-plugin-executable flags for the host executables SwiftPM built.
@@ -1183,7 +1202,10 @@ class Builder:
     def _common_flags(self):
         cmd = ["-target", f"arm64-apple-ios{self.ios}", "-sdk", str(self.tc.sdk), "-resource-dir", str(self.tc.resources)]
         if self.package:
-            cmd += ["-I", str(self.package.products), "-F", str(self.package.products / "PackageFrameworks")]
+            products = self.package.products
+            cmd += ["-I", str(products), "-F", str(products / "PackageFrameworks"), "-F", str(products)]
+            if (products / "include").is_dir():  # headers and module maps of binary targets
+                cmd += ["-I", str(products / "include")]
         return cmd
 
     def _link_flags(self):
@@ -1192,6 +1214,10 @@ class Builder:
             cmd.append(f"-ld-path={self.tc.linker}")
         if self.tc.runtime:  # provides __isPlatformVersionAtLeast for `if #available`
             cmd += ["-Xlinker", str(self.tc.runtime)]
+        if self.package and self.package.frameworks():
+            # The phone puts dynamic frameworks in Frameworks/ next to the builds.
+            cmd += ["-Xlinker", "-rpath", "-Xlinker", "@loader_path/Frameworks"]
+            cmd += [a for f in self.package.frameworks() for a in ("-framework", f.stem)]
         return cmd + (self.package.link_flags if self.package else [])
 
     @staticmethod
@@ -1213,7 +1239,8 @@ class Builder:
         objects = self.package.objects() if self.package else []
         if not objects:
             return None
-        key = hashlib.sha1(repr((self._stamp(objects), sign_key, self.ios)).encode()).hexdigest()[:12]
+        frameworks = self.package.frameworks()
+        key = hashlib.sha1(repr((self._stamp(objects), self._stamp(frameworks), sign_key, self.ios)).encode()).hexdigest()[:12]
         folder = self.out / "deps"
         path = folder / f"PeekDeps-{key}.dylib"
         if not path.exists():
@@ -1300,6 +1327,7 @@ class Builder:
             patch = self._patch(version, snapshot, deps, resources_key, language, shown)
             if patch:
                 patch.update(roots=self.base["roots"], resources=resources, deps=deps,
+                             frameworks=self.package.frameworks() if self.package else [],
                              seconds=time.time() - started)
                 return patch
 
@@ -1343,12 +1371,13 @@ class Builder:
                      "deps": deps[0] if deps else None, "resources": resources_key} if self.hot else None
         self._clean_old_builds(keep={dylib})
         return {"ok": True, "dylib": dylib, "file": name, "roots": roots, "seconds": elapsed,
-                "resources": resources, "deps": deps}
+                "resources": resources, "deps": deps, "frameworks": self.package.frameworks() if self.package else []}
 
     def _package_flags(self):
         if not self.package:
             return []
-        return ["-package-name", self.package.identity, *self.package.swift_flags, *self.package.macro_plugins()]
+        return ["-package-name", self.package.identity, *self.package.swift_flags, *self.package.macro_plugins(),
+                *self.package.module_maps()]
 
     def _clean_old_builds(self, keep):
         keep = set(keep) | ({self.out / self.base["file"]} if self.base else set())
@@ -1405,7 +1434,7 @@ def unpack_object(path, folder):
     data = path.read_bytes()
     if not data.startswith(b"!<arch>\n"):
         return [path]
-    found, offset = [], 8
+    found, offset, long_names = [], 8, b""
     while offset + 60 <= len(data):
         header = data[offset:offset + 60]
         name, size = header[:16].decode(errors="replace").strip(), int(header[48:58].decode().strip())
@@ -1413,6 +1442,13 @@ def unpack_object(path, folder):
         if name.startswith("#1/"):  # BSD long name: stored at the start of the body
             length = int(name[3:])
             name, body = body[:length].rstrip(b"\0").decode(errors="replace"), body[length:]
+        elif name == "//":  # GNU long-name table
+            long_names = body
+        elif name.startswith("/") and name[1:].isdigit():  # GNU long name: offset into that table
+            start = int(name[1:])
+            name = long_names[start:long_names.find(b"/\n", start)].decode(errors="replace")
+        elif name.endswith("/") and name != "/":  # GNU short name
+            name = name[:-1]
         if not name.startswith("__.SYMDEF") and name.endswith(".o"):
             out = folder / f"{path.stem}-{len(found)}-{Path(name).name}"
             out.write_bytes(body)
@@ -1589,6 +1625,13 @@ class Signer:
         private_dir()
         self.identifier_path.write_text(identifier)
         return True
+
+    def sign_in_place(self, binary):
+        proc = subprocess.run([self.tc.ldid, f"-K{self.p12}", "-U",
+                               *([f"-I{self.identifier}"] if self.identifier else []), "-S", str(binary)],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError("ldid failed: " + (proc.stderr or proc.stdout).strip())
 
     def sign(self, dylib):
         """Signs a copy of dylib and returns its path."""
@@ -1967,6 +2010,7 @@ class Hub:
         self.devices = {}
         self.lock = threading.Lock()  # serialises builds and certificate installs
         self.archives = {}  # resource archive id -> bytes
+        self.frameworks = None  # (id, archive bytes) of signed dynamic frameworks
         self.devices_saved = 0
         self.shot = 0  # screenshot requests so far; the phone answers each one
         self.shots = {}  # request number -> PNG bytes
@@ -2071,6 +2115,9 @@ class Hub:
                     self.signer.sign(path)
                 deps = (key, deps_signed)
                 state["deps"] = {"id": key, "size": deps_signed.stat().st_size}
+            if result.get("frameworks"):
+                self.package_frameworks(result["frameworks"])
+                state["frameworks"] = {"id": self.frameworks[0], "size": len(self.frameworks[1])}
         except Exception as e:
             log(str(e), "red")
             self.publish({"status": "error", "diagnostics": f"Signing failed: {e}"})
@@ -2080,6 +2127,24 @@ class Hub:
         else:
             log(f"built + signed in {result['seconds']:.1f}s → v{self.version + 1} ({', '.join(result['roots'])})", "green")
         self.publish({"status": "ready", "size": signed.stat().st_size, **state}, signed, deps)
+
+    def package_frameworks(self, frameworks):
+        """Signs copies of the dynamic frameworks and packs them for the phone (once per change)."""
+        key = hashlib.sha1(repr((Builder._stamp(p for f in frameworks for p in walk_files(f)),
+                                 self.signer.key())).encode()).hexdigest()[:12]
+        if self.frameworks and self.frameworks[0] == key:
+            return
+        staging = self.builder.out / "frameworks"
+        shutil.rmtree(staging, ignore_errors=True)
+        files = []
+        for framework in frameworks:
+            copy = staging / framework.name
+            shutil.copytree(framework, copy, symlinks=True)
+            binary = copy / framework.stem
+            if binary.exists():
+                self.signer.sign_in_place(binary)
+            files += [(f"{framework.name}/{p.relative_to(copy)}", p) for p in walk_files(copy)]
+        self.frameworks = (key, pack_resources(files))
 
     def resign(self):
         """Builds again (only linking, when nothing else changed) after the signing identity changed.
@@ -2236,6 +2301,12 @@ def make_handler(hub):
                 except OSError:
                     return self.reply(404, {"error": "stale dependencies"})
                 return self.sealed(data)
+            m = re.fullmatch(r"/v1/frameworks/(\w+)", url.path)
+            if m:
+                frameworks = hub.frameworks
+                if not frameworks or frameworks[0] != m.group(1):
+                    return self.reply(404, {"error": "stale frameworks"})
+                return self.sealed(frameworks[1])
             m = re.fullmatch(r"/v1/resources/(\w+)", url.path)
             if m:
                 archive = hub.archives.get(m.group(1))

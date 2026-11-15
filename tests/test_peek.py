@@ -312,6 +312,26 @@ class Archive(unittest.TestCase):
             self.assertEqual(len(found), 1)
             self.assertEqual(found[0].read_bytes(), b"\xcf\xfa\xed\xfeABC")
 
+    def test_unpack_gnu_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+
+            def member(name, body):
+                header = name.ljust(16) + "0".ljust(12) + "0".ljust(6) + "0".ljust(6) + "644".ljust(8) \
+                    + str(len(body)).ljust(10) + "`\n"
+                data = header.encode() + body
+                return data + (b"\n" if len(data) % 2 else b"")
+
+            long_name = "a_rather_long_object_name.o"
+            archive = tmp / "libX.a"
+            archive.write_bytes(b"!<arch>\n" + member("/", b"\0\0\0\0") + member("//", long_name.encode() + b"/\n")
+                                + member("/0", b"LONG") + member("short.o/", b"SHORT"))
+            out = tmp / "out"
+            out.mkdir()
+            found = peek.unpack_object(archive, out)
+            self.assertEqual(sorted(p.read_bytes() for p in found), [b"LONG", b"SHORT"])
+            self.assertTrue(any(long_name in p.name for p in found))
+
     def test_plain_object_is_returned_as_is(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "a.o"
