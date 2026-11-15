@@ -290,7 +290,9 @@ class Assets(unittest.TestCase):
         src = ('Image("Logo"); Color("Brand"); Color("Brand", bundle: .main); UIColor(named: "Brand")\n'
                'Image("Other"); Color("Nope") // Image("Logo")\nlet s = "Color(\\"Brand\\")"\n')
         out = peek.use_assets(src, {"Logo"}, {"Brand": {}})
-        self.assertIn('Image("Logo", bundle: .module); __peekColor("Brand"); __peekColor("Brand"); __peekUIColor("Brand")', out)
+        self.assertIn('__peekImage("Logo"); __peekColor("Brand"); __peekColor("Brand"); __peekUIColor("Brand")', out)
+        self.assertEqual(peek.use_assets('Image("Logo", bundle: .module) Image("Logo", bundle: Bundle.module)', {"Logo"}, {}),
+                         '__peekImage("Logo") __peekImage("Logo")')
         self.assertIn('Image("Other"); Color("Nope") // Image("Logo")', out)
         self.assertIn('let s = "Color(\\"Brand\\")"', out)
 
@@ -315,8 +317,33 @@ class AssetSymbols(unittest.TestCase):
     def test_symbol_lookups_are_rewritten(self):
         src = 'Color(.brand); Image(.appLogo); UIColor(resource: .brand); Color(.red); Image(.other) // Color(.brand)\n'
         out = peek.use_assets(src, {"app-logo"}, {"BrandColor": {}})
-        self.assertIn('__peekColor("BrandColor"); Image("app-logo", bundle: .module); (__peekUIColor("BrandColor") ?? .clear); '
+        self.assertIn('__peekColor("BrandColor"); __peekImage("app-logo"); (__peekUIColor("BrandColor") ?? .clear); '
                       'Color(.red); Image(.other) // Color(.brand)', out)
+
+
+class StringCatalogs(unittest.TestCase):
+    def test_catalog_becomes_strings_and_stringsdict(self):
+        import plistlib
+        catalog = {"sourceLanguage": "en", "version": "1.0", "strings": {
+            "hi": {"localizations": {"ko": {"stringUnit": {"value": "안녕 \"너\""}}}},
+            "untranslated": {},
+            "%lld items": {"localizations": {"en": {"variations": {"plural": {
+                "one": {"stringUnit": {"value": "%lld item"}}, "other": {"stringUnit": {"value": "%lld items"}}}}}}},
+            "tap": {"localizations": {"en": {"variations": {"device": {
+                "iphone": {"stringUnit": {"value": "Tap"}}, "mac": {"stringUnit": {"value": "Click"}}}}}}}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "Localizable.xcstrings"
+            path.write_text(json.dumps(catalog))
+            files = dict(peek.string_catalog_files(path, Path(tmp) / "out"))
+            self.assertEqual(sorted(files), ["en.lproj/Localizable.strings", "en.lproj/Localizable.stringsdict",
+                                             "ko.lproj/Localizable.strings"])
+            en = files["en.lproj/Localizable.strings"].read_text()
+            self.assertIn('"hi" = "hi";', en)
+            self.assertIn('"untranslated" = "untranslated";', en)
+            self.assertIn('"tap" = "Tap";', en)
+            self.assertIn('"hi" = "안녕 \\"너\\"";', files["ko.lproj/Localizable.strings"].read_text())
+            plural = plistlib.loads(files["en.lproj/Localizable.stringsdict"].read_bytes())["%lld items"]["value"]
+            self.assertEqual((plural["one"], plural["other"], plural["NSStringFormatValueTypeKey"]), ("%lld item", "%lld items", "lld"))
 
 
 class ReviewFixes(unittest.TestCase):

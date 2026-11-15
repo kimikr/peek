@@ -792,6 +792,15 @@ extension Foundation.Bundle {
         return Bundle(path: folder + "/%NAME%.bundle") ?? .main
     }()
 }
+
+// SwiftUI's Image(_:bundle:) only looks in compiled asset catalogs (Assets.car); peek ships loose
+// image files instead, which UIImage(named:in:with:) finds.
+func __peekImage(_ name: String) -> SwiftUI.Image {
+    if let image = UIImage(named: name, in: .module, with: nil) {
+        return SwiftUI.Image(uiImage: image)
+    }
+    return SwiftUI.Image(name, bundle: .module)
+}
 """
 
 
@@ -869,12 +878,14 @@ class Package:
     def settings(self, swift, wanted):
         """Build settings of the previewed target from Package.swift: language mode and swiftSettings."""
         self.language_mode, self.swift_flags, self.link_flags = None, [], []
+        self.default_localization = None
         proc = subprocess.run([str(swift) if swift.exists() else "swift", "package", "dump-package"],
                               cwd=self.root, capture_output=True, text=True, env=self.tc.swift_env())
         try:
             manifest = json.loads(proc.stdout[proc.stdout.index("{"):])
         except ValueError:
             return
+        self.default_localization = manifest.get("defaultLocalization")
         tools = manifest.get("toolsVersion", {}).get("_version", "5")
         modes = manifest.get("swiftLanguageModes") or manifest.get("swiftLanguageVersions") or []
         modes = [m.get("_0", m) if isinstance(m, dict) else m for m in modes]
@@ -1196,7 +1207,7 @@ def asset_symbols_source(colors, images, has_bundle):
               "}",
               "@available(iOS 17.0, *) extension SwiftUI.Image {",
               "    init(_ resource: DeveloperToolsSupport.ImageResource) {",
-              f'        self.init(__peekImageNames[resource] ?? "", bundle: {bundle})',
+              '        self = __peekImage(__peekImageNames[resource] ?? "")',
               "    }",
               "}",
               "@available(iOS 17.0, *) extension UIKit.UIImage {",
@@ -1234,7 +1245,8 @@ ASSET_CALLS = [
     ("color", re.compile(rf"\b(?:SwiftUI\.)?Color\([ \t]*{_STR}[ \t]*(?:,[ \t]*bundle:{_ARG}[ \t]*)?\)"), '__peekColor("{}")'),
     ("color", re.compile(rf"\bUIColor\([ \t]*named:[ \t]*{_STR}[ \t]*(?:,[ \t]*in:{_ARG},[ \t]*compatibleWith:{_ARG}[ \t]*)?\)"),
      '__peekUIColor("{}")'),
-    ("image", re.compile(rf"\b((?:SwiftUI\.)?Image)\([ \t]*{_STR}[ \t]*\)"), None),
+    ("image", re.compile(rf"\b(?:SwiftUI\.)?Image\([ \t]*{_STR}[ \t]*"
+                         r"(?:,[ \t]*bundle:[ \t]*(?:\.module|(?:Foundation\.)?Bundle\.module)[ \t]*)?\)"), '__peekImage("{}")'),
     ("image", re.compile(rf"\bUIImage\([ \t]*named:[ \t]*{_STR}[ \t]*\)"), 'UIImage(named: "{}", in: .module, with: nil)'),
 ]
 
@@ -1244,7 +1256,7 @@ SYMBOL_CALLS = [
     ("color", re.compile(r"\bUIColor\([ \t]*resource:[ \t]*\.([A-Za-z_][A-Za-z0-9_]*)[ \t]*\)"),
      '(__peekUIColor("{}") ?? .clear)'),
     ("image", re.compile(r"\b(?:SwiftUI\.)?Image\([ \t]*\.([A-Za-z_][A-Za-z0-9_]*)[ \t]*\)"),
-     'Image("{}", bundle: .module)'),
+     '__peekImage("{}")'),
     ("image", re.compile(r"\bUIImage\([ \t]*resource:[ \t]*\.([A-Za-z_][A-Za-z0-9_]*)[ \t]*\)"),
      '(UIImage(named: "{}", in: .module, with: nil) ?? UIImage())'),
 ]
@@ -1260,11 +1272,7 @@ def use_assets(src, images, colors):
             name = m.group(m.lastindex)
             if name not in names or mask[m.start()] == " ":
                 continue  # unknown name, or inside a comment or string
-            if template is None:
-                text = f'{m.group(1)}("{name}", bundle: .module)'
-            else:
-                text = template.format(name)
-            edits.append((m.start(), m.end(), text))
+            edits.append((m.start(), m.end(), template.format(name)))
     # Asset symbols: rewritten too, because in a hot patch (another module) the SDK's initialisers
     # and the ones in __PeekSupport.swift are ambiguous.
     for kind, pattern, template in SYMBOL_CALLS:
@@ -1280,6 +1288,61 @@ def use_assets(src, images, colors):
     for start, end, text in sorted(edits, reverse=True):
         src = src[:start] + text + src[end:]
     return src
+
+
+def _strings_literal(text):
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+
+
+def string_catalog_files(catalog, out):
+    """.strings and .stringsdict files for a string catalog (.xcstrings), which only Xcode compiles.
+
+    Writes <out>/<lang>.lproj/<Table>.strings(dict) and yields (path inside the bundle, file).
+    Plural variations become .stringsdict entries; device variations use their "other" form."""
+    try:
+        data = json.loads(Path(catalog).read_text())
+    except (OSError, ValueError):
+        return
+    table, source = Path(catalog).stem, data.get("sourceLanguage", "en")
+    plain, plurals = {}, {}  # lang -> {key: value}, lang -> {key: {category: value}}
+    for key, entry in (data.get("strings") or {}).items():
+        if entry.get("shouldTranslate") is False and not entry.get("localizations"):
+            continue
+        localizations = dict(entry.get("localizations") or {})
+        localizations.setdefault(source, {"stringUnit": {"value": key}})
+        for lang, loc in localizations.items():
+            unit = loc.get("stringUnit")
+            variations = loc.get("variations") or {}
+            if "device" in variations:
+                device = variations["device"]
+                pick = device.get("iphone") or device.get("other") or next(iter(device.values()), {})
+                unit, variations = pick.get("stringUnit"), pick.get("variations") or {}
+            if "plural" in variations:
+                forms = {cat: v.get("stringUnit", {}).get("value", "") for cat, v in variations["plural"].items()}
+                plurals.setdefault(lang, {})[key] = forms
+            elif unit and unit.get("value") is not None:
+                plain.setdefault(lang, {})[key] = unit["value"]
+    for lang in sorted(set(plain) | set(plurals)):
+        folder = Path(out) / f"{lang}.lproj"
+        folder.mkdir(parents=True, exist_ok=True)
+        if lang in plain:
+            path = folder / f"{table}.strings"
+            write_if_changed(path, "".join(f"{_strings_literal(k)} = {_strings_literal(v)};\n"
+                                           for k, v in sorted(plain[lang].items())))
+            yield f"{lang}.lproj/{table}.strings", path
+        if lang in plurals:
+            entries = {}
+            for key, forms in plurals[lang].items():
+                spec = re.search(r"%(?:\d+\$)?(?:l{0,2}|h{0,2}|z|t|j|q)?[dDuUioOxXcCfFeEgGaAsS@]", forms.get("other", key))
+                entries[key] = {"NSStringLocalizedFormatKey": "%#@value@",
+                                "value": {"NSStringFormatSpecTypeKey": "NSStringPluralRuleType",
+                                          "NSStringFormatValueTypeKey": spec.group(0)[1:].lstrip("0123456789$") if spec else "lld",
+                                          **forms}}
+            path = folder / f"{table}.stringsdict"
+            data_ = plistlib.dumps(entries)
+            if not path.exists() or path.read_bytes() != data_:
+                path.write_bytes(data_)
+            yield f"{lang}.lproj/{table}.stringsdict", path
 
 
 def flatten_asset_catalog(catalog):
@@ -1379,6 +1442,9 @@ class Builder:
             for path, rule in self.package.resources:
                 if path.suffix == ".xcassets":
                     continue  # flattened below
+                if path.suffix == ".xcstrings":
+                    files += [(f"{name}.bundle/{a}", f) for a, f in self._string_catalog(path)]
+                    continue
                 if path.is_dir():
                     for inner in walk_files(path):
                         files.append((f"{name}.bundle/{path.name}/{inner.relative_to(path)}", inner))
@@ -1389,12 +1455,22 @@ class Builder:
             catalogs = sorted(self.package.target_dir.rglob("*.xcassets"))
             if catalogs:
                 name = name or f"{self.package.name}_{self.package.target}"
+            if name:  # SwiftPM's bundles have one too; it tells Foundation the development language
+                info = self.out / "bundle-Info.plist"
+                data = plistlib.dumps({"CFBundleIdentifier": f"{self.package.name}.{self.package.target}.resources",
+                                       "CFBundleDevelopmentRegion": self.package.default_localization or "en"})
+                if not info.exists() or info.read_bytes() != data:
+                    info.write_bytes(data)
+                files.append((f"{name}.bundle/Info.plist", info))
         elif not self.single:
             name = "PeekResources"
             base = self.source_dir()
             for folder in sorted(p for p in base.rglob("Resources") if p.is_dir()):
                 for path in walk_files(folder, skip=lambda p: any(part.endswith(".xcassets") for part in p.parts)):
-                    files.append((f"{name}.bundle/{path.name}", path))
+                    if path.suffix != ".xcstrings":
+                        files.append((f"{name}.bundle/{path.name}", path))
+            for catalog in [p for p in walk_files(base) if p.suffix == ".xcstrings"]:
+                files += [(f"{name}.bundle/{a}", f) for a, f in self._string_catalog(catalog)]
             catalogs = sorted(base.rglob("*.xcassets"))
         else:
             catalogs = []
@@ -1412,6 +1488,10 @@ class Builder:
                        if name and a.startswith(f"{name}.bundle/") and a.count("/") == 1
                        and Path(a).suffix.lower() in (".png", ".jpg", ".jpeg", ".pdf", ".heic", ".gif")}
         return name, sorted(unique.items())
+
+    def _string_catalog(self, catalog):
+        out = self.out / "strings" / hashlib.sha1(str(catalog).encode()).hexdigest()[:8]
+        return list(string_catalog_files(catalog, out))
 
     @staticmethod
     def _stamp(paths):
