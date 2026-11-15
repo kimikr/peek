@@ -216,7 +216,9 @@ in the link is used. Pair with `peek link --qr` at any time.
 - **Asset catalogs** are not compiled: only image sets with one image per
   scale (no dark or size variants) and colour sets are available. A
   dependency (not the previewed target) with an asset catalog or a string
-  catalog cannot be built, since SwiftPM needs Xcode's tools for those. A
+  catalog cannot be built, since SwiftPM needs Xcode's tools for those; nor
+  can a package with its own macro targets whose previewed target has an
+  asset catalog (macros make SwiftPM build the whole package). A
   `DocumentGroup` that only views documents shows a placeholder, since there is
   no document to open.
 - **The preview lives in the Peek app's sandbox.** `UserDefaults`, the
