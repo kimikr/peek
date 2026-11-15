@@ -9,9 +9,12 @@ the new one. It is your real code, compiled by the real Swift compiler and
 drawn by the real SwiftUI on the device, so every API, animation and gesture
 behaves exactly as it will in your app.
 
-- **Fast.** Incremental builds: an edit in a 2,000-line app is on the phone in 1–2 s.
+- **Fast, and keeps your state.** Incremental builds: an edit in a 2,000-line app
+  is on the phone in 1–2 s, and when you only change function bodies the running
+  views are patched in place, so `@State` survives the reload.
 - **Your whole app.** `#Preview` blocks, UIKit views and controllers, or the
-  entire `@main` App, with package dependencies, macros and resources.
+  entire `@main` App (`DocumentGroup` too), with Swift, C, Objective-C and
+  `.xcframework` dependencies, macros, resources and colour sets.
 - **No Mac, no paid account.** A free Apple ID and SideStore, AltStore or
   LiveContainer is enough.
 - **Logs and screenshots.** `print()` output shows up in your terminal, and
@@ -47,6 +50,14 @@ $ peek dev MyApp/
 
 Package dependencies are linked into a separate library that the phone
 downloads once and keeps, so each reload only carries your own code.
+
+**State survives body edits.** Full builds are compiled so that any function
+can be replaced later (the way Xcode previews work). When an edit only touches
+the bodies of functions and computed properties (`body` included), peek sends
+a small patch with just those bodies; the phone loads it into the running
+build and re-renders, so views keep their identity and `@State`. Adding or
+changing stored properties, types or signatures needs a full build, which
+peek falls back to on its own (`--no-hot` always does full builds).
 
 iOS refuses to load code that is not signed by a certificate in a provisioning
 profile on the device with the same Team ID as the running app. So the library
@@ -120,9 +131,10 @@ version, and does a test build.
   view, a `UIViewController` or a `UIView`.
 - Without any `#Preview`: the whole app. The `@main` App's first
   `WindowGroup` is shown as a view (`--app` forces this even when previews
-  exist). Other scenes are left out, scene modifiers (`.commands`,
-  `.defaultSize`, …) are ignored, and `@UIApplicationDelegateAdaptor` creates
-  your delegate and calls `application(_:didFinishLaunchingWithOptions:)`.
+  exist); a `DocumentGroup` opens one new, unsaved document. Other scenes are
+  left out, scene modifiers (`.commands`, `.defaultSize`, …) are ignored, and
+  `@UIApplicationDelegateAdaptor` creates your delegate and calls
+  `application(_:didFinishLaunchingWithOptions:)`.
 - Otherwise `ContentView`, or the first `View` struct found.
 - Or say it explicitly: `peek dev . --root "SettingsView(model: .sample)"`.
 
@@ -145,13 +157,19 @@ That first build is slow; after it, saving a file in the previewed target takes
 the fast path again. Editing `Package.swift` or a dependency's sources triggers
 the SwiftPM build again. Use `--target` to pick a target other than the app's.
 
+**C, Objective-C and binary dependencies.** C-family targets are compiled by
+SwiftPM and imported through their module maps. Static libraries from
+`.xcframework` binary targets are linked into the dependency library; dynamic
+frameworks are signed and sent to the phone once.
+
 **Resources.** `Image("photo", bundle: .module)`, `Bundle.module.url(...)`
 and custom fonts work: resource bundles (the previewed target's and its
 dependencies') are sent to the phone alongside the build. Outside a package,
 files in folders named `Resources` are bundled the same way. Asset catalogs
-cannot be compiled without a Mac, so image sets in `.xcassets` are sent as
-loose images (found by `Image("name", bundle: .module)`); colour sets are not
-available.
+cannot be compiled without a Mac, so peek works around it: image sets are sent
+as loose images, colour sets (light and dark) become generated code, and
+`Image("name")`, `UIImage(named:)`, `Color("name")` and `UIColor(named:)` with
+a literal name of such an asset are pointed at them.
 
 See `examples/Weather` for a package with a dependency and a resource.
 
@@ -178,24 +196,25 @@ in the link is used. Pair with `peek link --qr` at any time.
 
 ## Limitations
 
-- **State resets on every reload.** A new build is a new set of types.
+- **State resets on full builds.** Body-only edits keep it; anything that
+  changes the shape of your types (stored properties, new types or methods,
+  signatures, resources) reloads the build and starts fresh.
 - **Rebuild time.** The first build of a project compiles everything (about
   9 s for 2,000 lines on a 2-core machine); after that an edit takes 1–2 s.
   Every build is loaded under the same module name; if that causes trouble,
   `--no-incremental` builds each version as a module of its own.
-- **Dependencies:** Swift targets and macros. C-family targets and binary
-  (`.xcframework`) targets are not handled yet; pass extra compiler flags with
-  `--swiftc-flag`.
-- **Apps built on `DocumentGroup`** cannot be previewed as a whole app; use
-  `#Preview` or `--root`.
+- **Asset symbols** generated by Xcode (`Color(.brand)`, `Image(.logo)`) are
+  not; use names. A `DocumentGroup` that only views documents shows a
+  placeholder, since there is no document to open.
 - **The preview lives in the Peek app's sandbox.** `UserDefaults`, the
   keychain and files are Peek's, so nothing your installed app has saved
   (settings, logins, caches) is there.
 - **`Bundle.main` is the Peek app's bundle**, so `Image("name")` without
   `bundle: .module`, your `Info.plist` keys, URL schemes, app extensions and
   entitlements (HealthKit, push, iCloud, App Groups, …) are not your app's.
-- **A crash in your view crashes the Peek app.** It will not reload the same
-  build automatically after that.
+- **A crash in your view crashes the Peek app.** When you open it again it
+  shows what the build printed last (a `fatalError` message, say) and loads
+  the next build on its own.
 - **Previewing Peek with Peek** shows "The last build quit the app" in the
   inner copy, because both copies share one set of preferences.
 - **Old builds stay in memory** until the app is restarted (dependencies
@@ -240,6 +259,7 @@ in the link is used. Pair with `peek link --qr` at any time.
 | Builds on Linux: examples, three real apps, UIKit previews, App rewriting | ✅ |
 | Server test suite (`python3 -m unittest discover tests`) | ✅ |
 | On that phone: encrypted protocol, incremental reload, dependency library, `print()` output, `peek shot`, light/dark and text size | ✅ |
+| 0.2 on a device: hot patching (state kept), C/Objective-C and `.xcframework` dependencies, colour sets, `DocumentGroup` | ⏳ built and tested on Linux only so far |
 | Peek installed directly with SideStore / AltStore | ⏳ not yet |
 | Bonjour discovery on a real Wi-Fi network | ⏳ not yet |
 
