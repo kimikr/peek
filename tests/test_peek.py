@@ -339,9 +339,38 @@ class ReviewFixes(unittest.TestCase):
                 (products / f"{name}.framework").mkdir()
                 (products / f"{name}.framework" / name).write_bytes(head)
             package = peek.Package.__new__(peek.Package)
-            package.products = products
+            package.products, package.scratch = products, Path(tmp) / "scratch"
             self.assertEqual([f.name for f in package.frameworks()], ["Dyn.framework", "Stat.framework"])
             self.assertEqual([f.name for f in package.dynamic_frameworks()], ["Dyn.framework"])
+
+    def test_xcframework_slices_are_staged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            libraries = []
+            for ident, lib, extra in (("ios-arm64", "libS.a", {"HeadersPath": "Headers"}),
+                                      ("ios-arm64_x86_64-simulator", "libS.a", {"SupportedPlatformVariant": "simulator"})):
+                folder = root / "S.xcframework" / ident
+                (folder / "Headers").mkdir(parents=True)
+                (folder / lib).write_bytes(b"!<arch>\n" + ident.encode())
+                (folder / "Headers" / "module.modulemap").write_text("module S {}")
+                libraries.append({"LibraryIdentifier": ident, "LibraryPath": lib, "SupportedPlatform": "ios",
+                                  "SupportedArchitectures": ["arm64"], **extra})
+            folder = root / "D.xcframework" / "ios-arm64" / "D.framework"
+            folder.mkdir(parents=True)
+            (folder / "D").write_bytes(b"\xcf\xfa\xed\xfe")
+            import plistlib
+            (root / "S.xcframework" / "Info.plist").write_bytes(plistlib.dumps({"AvailableLibraries": libraries}))
+            (root / "D.xcframework" / "Info.plist").write_bytes(plistlib.dumps({"AvailableLibraries": [
+                {"LibraryIdentifier": "ios-arm64", "LibraryPath": "D.framework", "SupportedPlatform": "ios",
+                 "SupportedArchitectures": ["arm64"]}]}))
+            package = peek.Package.__new__(peek.Package)
+            package.root, package.scratch, package.products = root, root / "scratch", root / "products"
+            package.product_names, package.excluded = set(), set()
+            package.binaries = {"S": "S.xcframework", "D": "D.xcframework"}
+            package.stage_binaries()
+            self.assertEqual([o.read_bytes() for o in package.objects()], [b"!<arch>\nios-arm64"])
+            self.assertEqual([f.name for f in package.dynamic_frameworks()], ["D.framework"])
+            self.assertEqual([p.name for p in package.header_paths()], ["S"])
 
 
 class PackageEdits(unittest.TestCase):

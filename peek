@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import os
+import plistlib
 import re
 import shutil
 import socket
@@ -842,7 +843,17 @@ class Package:
         self.local_deps = [Path(d["path"]) for d in info.get("dependencies", []) if d.get("type") == "fileSystem"]
         # What the previewed target depends on directly, and where those sources live: an edit
         # there only needs these built, not the previewed target (peek compiles that itself).
-        self.direct_targets = [t for t in target.get("target_dependencies") or [] if t in targets]
+        everything = {t["name"]: t for t in info["targets"]}
+        # Local macro targets are built for the host; binary targets cannot be built on their own,
+        # so peek unpacks those it needs itself (see stage_binaries).
+        self.direct_targets = [t for t in target.get("target_dependencies") or []
+                               if t in targets or everything.get(t, {}).get("type") == "macro"]
+        self.binaries = {n: everything[n].get("path") for n in needed | set(target.get("target_dependencies") or [])
+                         if everything.get(n, {}).get("type") == "binary"}
+        # The previewed target's resources: peek assembles its bundle (SwiftPM would need actool
+        # for asset catalogs, which only exists on a Mac).
+        self.resources = [(Path(r["path"]), "copy" if "copy" in (r.get("rule") or {}) else "process")
+                          for r in target.get("resources") or []]
         self.direct_products = list(target.get("product_dependencies") or [])
         self.dep_dirs = [(root / targets[n]["path"]).resolve() for n in needed if n in targets] \
             + [d.resolve() for d in self.local_deps]
@@ -904,16 +915,68 @@ class Package:
                 self.link_flags += [f"-l{value}"]
 
     def build(self, dependencies_only=False):
-        """Builds the package; with dependencies_only, just what the previewed target depends on."""
-        runs = [()]
-        if dependencies_only:
-            runs = [("--target", t) for t in self.direct_targets] + [("--product", p) for p in self.direct_products]
+        """Builds what the previewed target depends on (peek compiles the target itself).
+
+        The previewed target is never built by SwiftPM: that would compile it twice, and an asset
+        catalog in it would stop the whole build on Linux (no actool)."""
+        runs = [("--target", t) for t in self.direct_targets] + [("--product", p) for p in self.direct_products]
         output, ok = [], True
+        if not dependencies_only:
+            try:
+                self.stage_binaries()
+            except (OSError, ValueError) as e:
+                output.append(f"error: {e}")
+                ok = False
         for extra in runs:
             proc = self.tc.swift_build(self.root, self.scratch, extra)
             output += [l for l in (proc.stdout + proc.stderr).splitlines() if not re.fullmatch(r"\[\d+ / \d+\].*", l)]
             ok = ok and proc.returncode == 0
         return ok, "\n".join(output).strip()
+
+    @property
+    def staged(self):
+        return self.scratch / "peek-binaries"
+
+    def _find_binary(self, name, path):
+        if path and (self.root / path).exists():
+            return self.root / path
+        found = sorted((self.scratch / "artifacts").rglob(f"{name}.xcframework"))
+        if not found:  # a remote binary target: download it first
+            swift = Path(self.tc.swiftc).with_name("swift")
+            subprocess.run([str(swift) if swift.exists() else "swift", "package", "resolve", "--scratch-path",
+                            str(self.scratch)], cwd=self.root, capture_output=True, env=self.tc.swift_env())
+            found = sorted((self.scratch / "artifacts").rglob(f"{name}.xcframework"))
+        if not found:
+            raise ValueError(f"binary target {name}: no .xcframework found")
+        return found[0]
+
+    def stage_binaries(self):
+        """Unpacks the iOS device slice of each .xcframework the previewed target uses directly:
+        frameworks and static libraries into peek-binaries/, headers into peek-binaries/include/<name>."""
+        shutil.rmtree(self.staged, ignore_errors=True)
+        if not self.binaries:
+            return
+        self.staged.mkdir(parents=True)
+        for name, path in sorted(self.binaries.items()):
+            xcframework = self._find_binary(name, path)
+            with open(xcframework / "Info.plist", "rb") as f:
+                info = plistlib.load(f)
+            slice_ = next((l for l in info.get("AvailableLibraries", [])
+                           if l.get("SupportedPlatform") == "ios" and not l.get("SupportedPlatformVariant")
+                           and "arm64" in l.get("SupportedArchitectures", [])), None)
+            if not slice_:
+                raise ValueError(f"{xcframework.name} has no iOS device (arm64) library")
+            folder = xcframework / slice_["LibraryIdentifier"]
+            library = folder / slice_["LibraryPath"]
+            if library.is_dir():
+                shutil.copytree(library, self.staged / library.name, symlinks=True)
+            else:
+                shutil.copy2(library, self.staged / library.name)
+            if slice_.get("HeadersPath"):
+                shutil.copytree(folder / slice_["HeadersPath"], self.staged / "include" / name, symlinks=True)
+
+    def header_paths(self):
+        return sorted(p for p in (self.staged / "include").glob("*") if p.is_dir())
 
     def only_dependency_sources(self, paths):
         """True when every changed path is a Swift source of a dependency."""
@@ -923,11 +986,13 @@ class Package:
         """Object files of the dependencies, plus static libraries from binary (.xcframework) targets."""
         built = {f"lib{name}.a" for name in self.product_names}
         return [o for o in sorted(self.products.glob("*.o")) if o.stem not in self.excluded] + \
-            [a for a in sorted(self.products.glob("*.a")) if a.name not in built]
+            [a for a in sorted(self.products.glob("*.a")) if a.name not in built] + sorted(self.staged.glob("*.a"))
 
     def frameworks(self):
         """Frameworks from binary (.xcframework) targets, static or dynamic."""
-        return sorted(f for f in self.products.glob("*.framework") if f.is_dir())
+        staged = {f.name: f for f in self.staged.glob("*.framework") if f.is_dir()}
+        built = {f.name: f for f in self.products.glob("*.framework") if f.is_dir() and f.name not in staged}
+        return sorted({**built, **staged}.values())
 
     def dynamic_frameworks(self):
         """The frameworks whose binary is a dynamic library: signed and shipped to the phone.
@@ -1305,12 +1370,23 @@ class Builder:
         files, name = [], None
         if self.package:
             name = self.package.bundle_name
-            compiled = False
-            for bundle in self.package.bundles():
+            for bundle in self.package.bundles():  # the dependencies' bundles, built by SwiftPM
+                if bundle.stem == name:
+                    continue  # left by an older peek; the previewed target's bundle is made here
                 for path in walk_files(bundle):
                     files.append((f"{bundle.name}/{path.relative_to(bundle)}", path))
-                    compiled |= path.name == "Assets.car" and bundle.stem == name
-            catalogs = [] if compiled else sorted(self.package.target_dir.rglob("*.xcassets"))
+            # The previewed target's own resources, laid out the way SwiftPM's bundle has them.
+            for path, rule in self.package.resources:
+                if path.suffix == ".xcassets":
+                    continue  # flattened below
+                if path.is_dir():
+                    for inner in walk_files(path):
+                        files.append((f"{name}.bundle/{path.name}/{inner.relative_to(path)}", inner))
+                elif rule == "process" and path.parent.suffix == ".lproj":
+                    files.append((f"{name}.bundle/{path.parent.name}/{path.name}", path))
+                else:
+                    files.append((f"{name}.bundle/{path.name}", path))
+            catalogs = sorted(self.package.target_dir.rglob("*.xcassets"))
             if catalogs:
                 name = name or f"{self.package.name}_{self.package.target}"
         elif not self.single:
@@ -1376,7 +1452,7 @@ class Builder:
         if self.package and changed and self.package.only_dependency_sources(changed):
             ok, output = self.package.build(dependencies_only=True)
             if not ok:
-                self.package_error = output
+                self.package_error = "building the dependencies failed:\n" + output
             return ok
         try:
             self.package = Package(self.root, self.tc, self.wanted_target, self.scratch)
@@ -1385,8 +1461,7 @@ class Builder:
             return False
         ok, output = self.package.build()
         if not ok:
-            # The previewed target itself may be what failed; the fast build reports that better.
-            self.package_error = output
+            self.package_error = "building the dependencies failed:\n" + output
         return ok
 
     def _common_flags(self):
@@ -1396,6 +1471,9 @@ class Builder:
             cmd += ["-I", str(products), "-F", str(products / "PackageFrameworks"), "-F", str(products)]
             if (products / "include").is_dir():  # headers and module maps of binary targets
                 cmd += ["-I", str(products / "include")]
+            cmd += ["-F", str(self.package.staged)]
+            for headers in self.package.header_paths():
+                cmd += ["-I", str(headers)]
         return cmd
 
     def _link_flags(self):
@@ -1564,7 +1642,7 @@ class Builder:
             output = (output + "\n" + self._clean(proc.stdout + proc.stderr, shown)).strip()
         elapsed = time.time() - started
         if proc.returncode != 0 or not dylib.exists():
-            if self.package_error and "error:" not in output:
+            if self.package_error:  # a dependency that failed explains the errors that follow
                 output = self.package_error + "\n\n" + output
             return {"ok": False, "diagnostics": output.strip() or "swiftc failed", "seconds": elapsed}
         self.base = {"version": version, "file": name, "snapshot": snapshot, "roots": roots,
@@ -2256,7 +2334,7 @@ class Hub:
             ok = self.builder.prepare_package(changed)
             if ok:
                 log(f"dependencies ready ({time.time() - started:.1f}s)", "dim")
-            elif not self.builder.package:
+            else:
                 log(self.builder.package_error, "red")
 
     def full_rebuild(self, reason):
