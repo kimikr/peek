@@ -364,6 +364,23 @@ class SwiftPMOutput(unittest.TestCase):
         self.assertEqual(peek.clean_swiftpm_line("\x1b[0;1;31merror: \x1b[0mbad"), "error: bad")
 
 
+class TestRunner(unittest.TestCase):
+    def test_imports_of_the_tested_module_are_dropped(self):
+        src = "import Testing\n@testable import Calc\nimport Calc\n@testable import Other\nimport SwiftUI\n"
+        tested = {"Calc"}
+        out = peek.TESTED_IMPORT_RE.sub(lambda m: peek._blank(m.group(0)) if m.group(2) in tested else m.group(0), src)
+        self.assertEqual(out, "import Testing\n\n\n@testable import Other\nimport SwiftUI\n")
+
+    def test_copy_names_in_output_are_mapped(self):
+        line = "✘ Test x() recorded an issue at 1b5b7e1e_CalcTests.swift:25:9: Expectation failed"
+        names = {"1b5b7e1e_CalcTests.swift": "Tests/CalcTests/CalcTests.swift"}
+        self.assertEqual(peek.COPY_NAME_RE.sub(lambda m: names.get(m.group(0), m.group(0)), line),
+                         "✘ Test x() recorded an issue at Tests/CalcTests/CalcTests.swift:25:9: Expectation failed")
+
+    def test_runner_runs_only_its_own_module(self):
+        self.assertIn('arguments.filter = ["^\\(module)\\\\."]', peek.TEST_RUNNER_SOURCE)
+
+
 class ReviewFixes(unittest.TestCase):
     def test_types_made_equatable_in_an_extension_keep_their_shape(self):
         sources = ["struct Row: View { var body: some View { Text(\"r\") } }\n",

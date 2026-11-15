@@ -15,6 +15,8 @@ behaves exactly as it will in your app.
 - **Your whole app.** `#Preview` blocks, UIKit views and controllers, or the
   entire `@main` App (`DocumentGroup` too), with Swift, C, Objective-C, C++ and
   `.xcframework` dependencies, macros, resources, colour sets and asset symbols.
+- **Tests on the device.** `peek test` runs your Swift Testing suites on the
+  iPhone, with real UIKit and SwiftUI, every time you save.
 - **No Mac, no paid account.** A free Apple ID and SideStore, AltStore or
   LiveContainer is enough.
 - **Logs and screenshots.** `print()` output shows up in your terminal, and
@@ -179,7 +181,8 @@ generates (`Color(.brand)`, `.foregroundStyle(.brand)`, `Image(.logo)`,
 String catalogs (`.xcstrings`) become `.strings` and `.stringsdict` files
 (plurals included), so `String(localized:bundle: .module)` is translated.
 
-See `examples/Weather` for a package with a dependency and a resource.
+See `examples/Weather` for a package with a dependency and a resource, and
+`examples/Calculator` for one with Swift Testing tests (`peek test`).
 
 ### While previewing
 
@@ -194,6 +197,25 @@ See `examples/Weather` for a package with a dependency and a resource.
   settings.
 - **Errors.** A compile error is shown over the last preview that worked. So
   is a build that fails to load: the previous one stays on screen.
+
+### Running tests on the phone
+
+```
+peek test path/to/Package
+```
+
+runs the package's [Swift Testing](https://developer.apple.com/documentation/testing)
+tests inside the Peek app on the iPhone, with the real UIKit and SwiftUI, and
+again every time you save. So tests that render views (`ImageRenderer`), use
+UIKit or need the device run from Linux, where `swift test` cannot run them.
+Results appear in the terminal as `swift test` prints them (failures in red,
+with file and line); the phone shows whether everything passed.
+
+The test targets that depend on the previewed target are compiled into the
+same module as the code they test (`@testable import` is not needed but does
+no harm), along with their dependencies. Outside a package, tests come from
+`Tests/` next to `Sources/`. Testing.framework comes from the iOS SDK; peek
+signs it and sends it to the phone once. XCTest tests are not supported yet.
 
 ### Finding the server
 
@@ -276,6 +298,7 @@ in the link is used. Pair with `peek link --qr` at any time.
 | On that phone: encrypted protocol, incremental reload, dependency library, `print()` output, `peek shot`, light/dark and text size | ✅ |
 | 0.2 on that phone: hot patching keeps `@State` across body edits, chained patches, closure changes, fallback to a full build | ✅ |
 | 0.2 on that phone: colour sets (light and dark), system colour references, asset symbols, image sets, string catalogs (plurals, Korean), C, Objective-C and C++ dependencies, static and dynamic `.xcframework`s, `DocumentGroup` | ✅ |
+| `peek test` on that phone: Swift Testing suites, parameterized tests, `ImageRenderer`, failures with file and line, re-run on save | ✅ |
 | Peek installed directly with SideStore / AltStore | ⏳ not yet |
 | Bonjour discovery on a real Wi-Fi network | ⏳ not yet |
 

@@ -80,7 +80,7 @@ class Toolchain:
         self.swiftc = self._find("swiftc", [Path.home() / ".local/share/swiftly/bin/swiftc"])
         self.ldid = self._find("ldid", [Path.home() / ".local/bin/ldid"])
         self.openssl = self._find("openssl", [])
-        self.sdk = self.resources = self.linker = self.runtime = self.bundle = None
+        self.sdk = self.resources = self.linker = self.runtime = self.bundle = self.developer = None
         for root in (Path.home() / ".swiftpm/swift-sdks", Path.home() / "Library/org.swift.swiftpm/swift-sdks"):
             for manifest in sorted(root.glob("*.artifactbundle/swift-sdk.json")):
                 try:
@@ -89,6 +89,8 @@ class Toolchain:
                     continue
                 bundle = self.bundle = manifest.parent
                 self.sdk = bundle / triple["sdkRootPath"]
+                # Platform Developer folder: XCTest and Testing live here, next to SDKs/.
+                self.developer = self.sdk.resolve().parent.parent
                 self.resources = bundle / triple["swiftResourcesPath"]
                 linker = bundle / "toolset/bin/ld64.lld"
                 self.linker = linker if linker.exists() else None
@@ -783,6 +785,46 @@ extension SwiftUI.View {
 }
 """
 
+# `peek test`: the preview is a runner that starts Swift Testing in the app. Its console output
+# reaches the terminal like any print(); the screen shows the outcome.
+TEST_RUNNER_SOURCE = """
+import Testing
+
+struct __PeekTestRunner: SwiftUI.View {
+    @SwiftUI.State private var result: CInt?
+    @SwiftUI.State private var started = Date()
+    @SwiftUI.State private var seconds = 0.0
+
+    var body: some SwiftUI.View {
+        SwiftUI.VStack(spacing: 16) {
+            if let result {
+                SwiftUI.Image(systemName: result == 0 ? "checkmark.circle.fill" : "xmark.octagon.fill")
+                    .font(.system(size: 64))
+                    .foregroundStyle(result == 0 ? SwiftUI.Color.green : SwiftUI.Color.red)
+                SwiftUI.Text(result == 0 ? "All tests passed" : "Some tests failed").font(.title2.bold())
+                SwiftUI.Text(String(format: "%.2f s · details in the terminal", seconds)).foregroundStyle(.secondary)
+            } else {
+                SwiftUI.ProgressView().controlSize(.large)
+                SwiftUI.Text("Running tests…").font(.title2)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .task {
+            started = Date()
+            let module = String(reflecting: __PeekTestRunner.self).split(separator: ".")[0]
+            let code = await Task.detached { () -> CInt in
+                var arguments = __CommandLineArguments_v0()
+                arguments.filter = ["^\\(module)\\\\."]  // this build's tests, not those of earlier builds
+                return await __swiftPMEntryPoint(passing: arguments)
+            }.value
+            seconds = Date().timeIntervalSince(started)
+            result = code
+            print(code == 0 ? "peek: all tests passed" : "peek: tests failed (exit code \\(code))")
+        }
+    }
+}
+"""
+
 # The Peek app unpacks resource bundles on the phone and points this variable at their folder.
 # SwiftPM's own generated accessor (used by dependencies) honours the same variable in debug builds.
 BUNDLE_TEMPLATE = """
@@ -841,7 +883,7 @@ class Package:
 
     SKIP_TYPES = {"test", "plugin", "macro", "system-target", "binary", "snippet"}
 
-    def __init__(self, root, toolchain, wanted, scratch):
+    def __init__(self, root, toolchain, wanted, scratch, tests=False):
         self.root, self.tc, self.scratch = root, toolchain, scratch
         self.products = scratch / "out/Products/Debug-iphoneos"
         swift = Path(toolchain.swiftc).with_name("swift")
@@ -871,7 +913,19 @@ class Package:
         self.target = wanted
         self.target_dir = (root / target["path"]).resolve()
         self.bundle_name = f"{self.name}_{wanted}" if target.get("resources") else None
-        needed, queue = set(), [wanted]
+        # With tests, the test targets that depend on the previewed target are compiled into the
+        # same module, so their own dependencies are needed as well.
+        self.test_targets = [t for t in info["targets"] if t.get("type") == "test"
+                             and wanted in (t.get("target_dependencies") or [])] if tests else []
+        if tests and not self.test_targets:
+            raise ValueError(f"no test target depends on {wanted}")
+        self.test_dirs = [(root / t["path"]).resolve() for t in self.test_targets]
+        direct = list(dict.fromkeys(list(target.get("target_dependencies") or []) + [
+            d for t in self.test_targets for d in t.get("target_dependencies") or [] if d != wanted]))
+        products = list(dict.fromkeys(list(target.get("product_dependencies") or []) + [
+            d for t in self.test_targets for d in t.get("product_dependencies") or []]))
+        needed, queue = set(), [wanted] + [d for d in direct if d in targets]
+        needed.update(queue[1:])
         while queue:
             for dep in targets.get(queue.pop(), {}).get("target_dependencies", []):
                 if dep not in needed:
@@ -883,19 +937,19 @@ class Package:
         # What the previewed target depends on directly, and where those sources live: an edit
         # there only needs these built, not the previewed target (peek compiles that itself).
         everything = {t["name"]: t for t in info["targets"]}
-        self.direct_targets = [t for t in target.get("target_dependencies") or [] if t in targets]
+        self.direct_targets = [t for t in direct if t in targets]
         # Macro targets cannot be built on their own (SwiftBuild has a host and a device copy of
         # each and refuses the name), so a package with local macros is built as a whole.
-        self.local_macros = [n for n in needed | set(target.get("target_dependencies") or [])
+        self.local_macros = [n for n in needed | set(direct)
                              if everything.get(n, {}).get("type") == "macro"]
         # Binary targets cannot be built on their own, so peek unpacks those it needs (stage_binaries).
-        self.binaries = {n: everything[n].get("path") for n in needed | set(target.get("target_dependencies") or [])
+        self.binaries = {n: everything[n].get("path") for n in needed | set(direct)
                          if everything.get(n, {}).get("type") == "binary"}
         # The previewed target's resources: peek assembles its bundle (SwiftPM would need actool
         # for asset catalogs, which only exists on a Mac).
         self.resources = [(Path(r["path"]), "copy" if "copy" in (r.get("rule") or {}) else "process")
                           for r in target.get("resources") or []]
-        self.direct_products = list(target.get("product_dependencies") or [])
+        self.direct_products = products
         self.dep_dirs = [(root / targets[n]["path"]).resolve() for n in needed if n in targets] \
             + [d.resolve() for d in self.local_deps]
         # SwiftPM names the root package after its folder; `package` declarations need the same name.
@@ -1184,6 +1238,8 @@ def colors_source(colors):
             "    SwiftUI.Color(uiColor: __peekUIColor(name) ?? .clear)\n}\n")
 
 
+TESTED_IMPORT_RE = re.compile(r"^[ \t]*(@testable[ \t]+)?import[ \t]+(\w+)[ \t]*$", re.M)
+
 SWIFT_KEYWORDS = set("""associatedtype class deinit enum extension fileprivate func import init inout internal let
 open operator private precedencegroup protocol public rethrows static struct subscript typealias var break case
 catch continue default defer do else fallthrough for guard if in repeat return throw switch where while as false is
@@ -1434,7 +1490,12 @@ class Builder:
         self.extra = args.swiftc_flag or []
         self.incremental = not getattr(args, "no_incremental", False)
         # Hot patching keeps view state across edits that only change function bodies.
-        self.hot = self.incremental and not getattr(args, "no_hot", False)
+        self.tests = getattr(args, "tests", False)  # run the test targets on the phone instead of previews
+        if self.tests:
+            # Earlier builds stay loaded and Swift Testing finds tests in every loaded image, so
+            # each build gets a module of its own and the runner only runs that module's tests.
+            self.incremental = False
+        self.hot = self.incremental and not getattr(args, "no_hot", False) and not self.tests
         self.base = None  # the last full build, which patches apply to
         self.force_full = False
         self.patch_error = None
@@ -1453,6 +1514,7 @@ class Builder:
         self.package = None
         self.package_error = None
         self.colors, self.images = {}, set()
+        self.display_names = {}
 
     @property
     def ios(self):
@@ -1477,7 +1539,19 @@ class Builder:
     def sources(self):
         if self.single:
             return [self.single]
-        return [p for p in walk_files(self.source_dir()) if p.suffix == ".swift" and p.name != "Package.swift"]
+        found = [p for p in walk_files(self.source_dir()) if p.suffix == ".swift" and p.name != "Package.swift"]
+        return found + [p for p in self.test_sources() if p not in found]
+
+    def test_dirs(self):
+        if not self.tests:
+            return []
+        if self.package:
+            return self.package.test_dirs
+        return [self.root / "Tests"] if (self.root / "Tests").is_dir() else []
+
+    def test_sources(self):
+        return [p for d in self.test_dirs() for p in sorted(d.rglob("*.swift"))
+                if not any(part in SKIP_DIRS - {"Tests"} or part.startswith(".") for part in p.relative_to(d).parts)]
 
     def resources(self):
         """Returns (bundle name for Bundle.module or None, [(path inside the archive, file)])."""
@@ -1569,8 +1643,10 @@ class Builder:
         roots = [self.root] + [d for d in (self.package.local_deps if self.package else [])
                                if self.root not in d.parents]
 
-        def previewed_source(path):  # the previewed target's files: peek builds those itself
-            return target_dir is not None and target_dir in path.parents and path.name != "Package.swift"
+        own = [target_dir] + (self.package.test_dirs if self.package else []) if target_dir else []
+
+        def previewed_source(path):  # the previewed target's (and its tests') files: peek builds those itself
+            return any(d in path.parents for d in own) and path.name != "Package.swift"
 
         return self._stamp(p for base in roots for p in walk_files(base, skip=previewed_source))
 
@@ -1588,7 +1664,7 @@ class Builder:
                 self.package_error = "building the dependencies failed:\n" + output
             return ok
         try:
-            self.package = Package(self.root, self.tc, self.wanted_target, self.scratch)
+            self.package = Package(self.root, self.tc, self.wanted_target, self.scratch, tests=self.tests)
         except (ValueError, OSError) as e:
             self.package, self.package_error = None, f"Package.swift: {e}"
             return False
@@ -1596,6 +1672,14 @@ class Builder:
         if not ok:
             self.package_error = "building the dependencies failed:\n" + output
         return ok
+
+    def shipped_frameworks(self):
+        """Dynamic frameworks (and libraries) the phone needs next to the builds."""
+        found = self.package.dynamic_frameworks() if self.package else []
+        if self.tests:
+            found = found + [self.tc.developer / "Library/Frameworks/Testing.framework",
+                             self.tc.developer / "usr/lib/lib_TestingInterop.dylib"]
+        return found
 
     def _common_flags(self):
         cmd = ["-target", f"arm64-apple-ios{self.ios}", "-sdk", str(self.tc.sdk), "-resource-dir", str(self.tc.resources)]
@@ -1607,6 +1691,8 @@ class Builder:
             cmd += ["-F", str(self.package.staged)]
             for headers in self.package.header_paths():
                 cmd += ["-I", str(headers)]
+        if self.tests:  # Testing.framework ships with the SDK, outside the SDK root
+            cmd += ["-F", str(self.tc.developer / "Library/Frameworks")]
         return cmd
 
     def _link_flags(self):
@@ -1617,9 +1703,11 @@ class Builder:
             cmd += ["-Xlinker", str(self.tc.runtime)]
         if self.package and self.package.frameworks():
             cmd += [a for f in self.package.frameworks() for a in ("-framework", f.stem)]
-            if self.package.dynamic_frameworks():
-                # The phone puts dynamic frameworks in Frameworks/ next to the builds.
-                cmd += ["-Xlinker", "-rpath", "-Xlinker", "@loader_path/Frameworks"]
+        if self.tests:
+            cmd += ["-framework", "Testing"]
+        if self.shipped_frameworks():
+            # The phone puts dynamic frameworks in Frameworks/ next to the builds.
+            cmd += ["-Xlinker", "-rpath", "-Xlinker", "@loader_path/Frameworks"]
         return cmd + (self.package.link_flags if self.package else [])
 
     @staticmethod
@@ -1687,10 +1775,22 @@ class Builder:
         # A project that keeps Xcode's generated asset symbols in its sources brings its own.
         own_symbols = any(re.search(r"extension\s+(?:DeveloperToolsSupport\.)?(?:Color|Image)Resource\b", t)
                           for t in texts.values())
+        test_files = set(self.test_sources())
+        if self.tests and not test_files:
+            return {"ok": False, "diagnostics": "No tests found (peek test looks in the test targets of the "
+                                                "package, or in Tests/ next to Sources/)."}
+        if any(re.search(r"^[ \t]*(?:@testable[ \t]+)?import[ \t]+XCTest\b", texts[p], re.M) for p in test_files):
+            return {"ok": False, "diagnostics": "These tests use XCTest; peek test runs Swift Testing (`import Testing`, "
+                                                "@Test) only for now."}
+        tested = {self.package.target, re.sub(r"\W", "_", self.package.target)} if self.package else set()
         for path in sources:
             shown = path.name if self.single else str(path.relative_to(self.root))
             tag = hashlib.sha1(shown.encode()).hexdigest()[:8]
             text = texts[path]
+            if path in test_files:
+                # Tests are compiled into the same module as the code they test.
+                text = TESTED_IMPORT_RE.sub(lambda m: _blank(m.group(0)) if m.group(2) in tested
+                                            or (m.group(1) and not self.package) else m.group(0), text)
             new, found, app_struct = rewrite_source(text, tag, keep_shape)
             new = use_assets(new, self.images if bundle_name else set(), self.colors)
             roots += found
@@ -1699,7 +1799,9 @@ class Builder:
             copy = srcdir / f"{tag}_{path.name}"
             write_if_changed(copy, new)
             inputs.append((copy, shown))
-        if self.root_expr:
+        if self.tests:
+            cases = [("__PeekTestRunner()", "Tests")]
+        elif self.root_expr:
             cases = [(self.root_expr, self.root_expr)]
         elif roots and not self.prefer_app:
             cases = [(f"{name}()", title or f"Preview {n + 1}") for n, (name, title) in enumerate(roots)]
@@ -1718,13 +1820,15 @@ class Builder:
         support, entry = srcdir / "__PeekSupport.swift", srcdir / "__PeekEntry.swift"
         write_if_changed(support, SUPPORT_SOURCE + (BUNDLE_TEMPLATE.replace("%NAME%", bundle_name) if bundle_name else "")
                          + colors_source(self.colors)
-                         + ("" if own_symbols else asset_symbols_source(self.colors, self.images, bool(bundle_name))))
+                         + ("" if own_symbols else asset_symbols_source(self.colors, self.images, bool(bundle_name)))
+                         + (TEST_RUNNER_SOURCE if self.tests else ""))
         write_if_changed(entry, ENTRY_TEMPLATE.replace("%CASES%", body))
         files = [c for c, _ in inputs] + [support, entry]
         for stale in srcdir.glob("*.swift"):
             if stale not in files:
                 stale.unlink()
         shown = [(str(c), s) for c, s in inputs] + [(str(srcdir) + "/", "")]
+        self.display_names = {c.name: s for c, s in inputs}  # for file names in the phone's output
         language = self.swift_version or (self.package.language_mode if self.package else None) or "5"
         snapshot = {f.name: f.read_text() for f in files}
         resources_key = repr(self._stamp(p for _, p in resources)) + repr([a for a, _ in resources])
@@ -1740,7 +1844,7 @@ class Builder:
                 return patch
             if patch:
                 patch.update(roots=self.base["roots"], resources=resources, deps=deps,
-                             frameworks=self.package.dynamic_frameworks() if self.package else [],
+                             frameworks=self.shipped_frameworks(),
                              seconds=time.time() - started)
                 return patch
 
@@ -1749,7 +1853,7 @@ class Builder:
             output_map[str(f)] = {"object": str(objdir / f"{f.stem}.o"),
                                   "swift-dependencies": str(objdir / f"{f.stem}.swiftdeps")}
         write_if_changed(self.out / "output-file-map.json", json.dumps(output_map, indent=1))
-        module = "PeekPreview" if self.incremental else f"PeekBuild{version}"
+        module = "PeekPreview" if self.incremental else f"PeekBuild_{self.session}_{version}"  # unique per server run too: old builds stay loaded
         if not self.incremental:
             for old in objdir.glob("*"):
                 old.unlink()
@@ -1782,7 +1886,7 @@ class Builder:
                      "deps": deps[0] if deps else None, "resources": resources_key} if self.hot else None
         self._clean_old_builds(keep={dylib})
         return {"ok": True, "dylib": dylib, "file": name, "roots": roots, "seconds": elapsed,
-                "resources": resources, "deps": deps, "frameworks": self.package.dynamic_frameworks() if self.package else []}
+                "resources": resources, "deps": deps, "frameworks": self.shipped_frameworks()}
 
     def _package_flags(self):
         if not self.package:
@@ -2077,6 +2181,7 @@ class Signer:
 
 OPENSSL = shutil.which("openssl") or "openssl"
 SEALED_TYPE = "application/x-peek-sealed"
+COPY_NAME_RE = re.compile(r"\b[0-9a-f]{8}_[\w.+-]+\.swift\b")  # peek's copies of the sources
 DUPLICATE_CLASS_RE = re.compile(r"objc\[\d+\]: Class \S+ is implemented in both ")
 
 
@@ -2552,7 +2657,7 @@ class Hub:
 
     def package_frameworks(self, frameworks):
         """Signs copies of the dynamic frameworks and packs them for the phone (once per change)."""
-        key = hashlib.sha1(repr((Builder._stamp(p for f in frameworks for p in walk_files(f)),
+        key = hashlib.sha1(repr((Builder._stamp(p for f in frameworks for p in ([f] if f.is_file() else walk_files(f))),
                                  self.signer.key())).encode()).hexdigest()[:12]
         if self.frameworks and self.frameworks[0] == key:
             return
@@ -2561,6 +2666,12 @@ class Hub:
         files = []
         for framework in frameworks:
             copy = staging / framework.name
+            if framework.is_file():  # a plain dylib (lib_TestingInterop.dylib)
+                staging.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(framework, copy)
+                self.signer.sign_in_place(copy)
+                files.append((framework.name, copy))
+                continue
             shutil.copytree(framework, copy, symlinks=True)
             binary = copy / framework.stem
             if binary.exists():
@@ -2765,7 +2876,9 @@ def make_handler(hub):
                         for line in str(entry["output"]).rstrip("\n").split("\n"):
                             if DUPLICATE_CLASS_RE.match(line):
                                 continue  # every reload brings the same class names again; expected
-                            log(f"│ {printable(line)}", "dim" if level != "crash" else "red")
+                            line = COPY_NAME_RE.sub(lambda m: getattr(hub.builder, "display_names", {}).get(m.group(0), m.group(0)), line)
+                            color = "red" if level == "crash" or line.lstrip().startswith("✘") else "dim"
+                            log(f"│ {printable(line)}", color)
                     elif entry.get("message"):
                         log(f"[phone] {printable(entry['message'])}", {"error": "red", "warn": "yellow"}.get(level, "dim"))
                     if isinstance(entry.get("diagnostics"), dict):
@@ -3131,8 +3244,17 @@ def main():
     dev.add_argument("--no-discovery", action="store_true", help="do not advertise the server with Bonjour")
     dev.set_defaults(func=cmd_dev)
 
+    test = sub.add_parser("test", help="run the package's tests on the phone, again on every save")
+    common(test)
+    test.add_argument("--port", type=int, default=8765)
+    test.add_argument("--bind", help="address to listen on (default: the addresses in the pairing link, and loopback)")
+    test.add_argument("--host", action="append", help="address to advertise in the pairing link (repeatable)")
+    test.add_argument("--no-discovery", action="store_true", help="do not advertise the server with Bonjour")
+    test.set_defaults(func=cmd_dev, tests=True)
+
     build = sub.add_parser("build", help="compile once and report errors (no server)")
     common(build)
+    build.add_argument("--tests", action="store_true", help="build the test runner instead of the previews")
     build.set_defaults(func=cmd_build)
 
     cert = sub.add_parser("cert", help="install the signing certificate from a .p12 file")
