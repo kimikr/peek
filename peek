@@ -2043,6 +2043,29 @@ def unpack_object(path, folder):
     return found
 
 
+def thin_to_arm64(path):
+    """Keeps only the plain arm64 slice of a universal (fat) Mach-O, in place. Apple's SDK
+    frameworks also carry arm64e, which apps (and LiveContainer) never load: half the download."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) < 8 or data[:4] not in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"):
+        return False
+    wide = data[3] == 0xBF
+    count = struct.unpack(">I", data[4:8])[0]
+    entry = 32 if wide else 20
+    for n in range(count):
+        at = 8 + n * entry
+        if wide:
+            cpu, sub, offset, size = struct.unpack(">iiQQ", data[at:at + 24])
+        else:
+            cpu, sub, offset, size = struct.unpack(">iiII", data[at:at + 16])
+        if cpu == 0x0100000C and (sub & 0xFFFFFF) != 2:  # CPU_TYPE_ARM64, not arm64e
+            with open(path, "wb") as f:
+                f.write(data[offset:offset + size])
+            return True
+    return False
+
+
 def write_if_changed(path, text):
     """Writes text to path unless it already holds it, so unchanged files keep their timestamps."""
     try:
@@ -2733,12 +2756,14 @@ class Hub:
             if framework.is_file():  # a plain dylib (lib_TestingInterop.dylib)
                 staging.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(framework, copy)
+                thin_to_arm64(copy)
                 self.signer.sign_in_place(copy)
                 files.append((framework.name, copy))
                 continue
             shutil.copytree(framework, copy, symlinks=True)
             binary = copy / framework.stem
             if binary.exists():
+                thin_to_arm64(binary)
                 self.signer.sign_in_place(binary)
             files += [(f"{framework.name}/{p.relative_to(copy)}", p) for p in walk_files(copy)]
         self.frameworks = (key, pack_resources(files))
