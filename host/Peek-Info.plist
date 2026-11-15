@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.1</string>
+	<string>0.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>2</string>
+	<string>3</string>
     <key>CFBundleDisplayName</key>
     <string>Peek</string>
     <!-- peek://connect?... pairing links and the certificate callback from SideStore/AltStore -->
@@ -13,9 +13,9 @@
     <array>
         <dict>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.1</string>
+	<string>0.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>2</string>
+	<string>3</string>
             <key>CFBundleURLName</key>
             <string>kim.jihwan.peek</string>
             <key>CFBundleURLSchemes</key>
@@ -33,9 +33,9 @@
     <key>NSAppTransportSecurity</key>
     <dict>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.1</string>
+	<string>0.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>2</string>
+	<string>3</string>
         <key>NSAllowsArbitraryLoads</key>
         <true/>
     </dict>

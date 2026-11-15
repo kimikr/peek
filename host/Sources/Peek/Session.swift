@@ -6,8 +6,8 @@ import os
 /// This app's release, and the version of the protocol it speaks with the `peek` script.
 /// Both must match the script's VERSION and PROTOCOL (the release script checks).
 enum PeekVersion {
-    static let app = "0.1.1"
-    static let proto = 1
+    static let app = "0.2.0"
+    static let proto = 2
 }
 
 /// The dev server answered with HTTP 426: it speaks another protocol version.
@@ -31,6 +31,13 @@ struct ServerState: Decodable, Equatable {
     var deps: Resources?  // the package's dependencies, linked once into a library of their own
     var shot: Int?  // screenshot requests so far (`peek shot`)
     var peek: String?
+    var file: String?  // the name the build must be saved under (patches refer to their base by it)
+    var patch: Patch?  // set when this build only replaces functions in the build named baseFile
+
+    struct Patch: Decodable, Equatable {
+        var base: Int
+        var baseFile: String
+    }
     var `protocol`: Int?  // absent from 0.1.0 servers, which speak protocol 1
 
     struct Resources: Decodable, Equatable {
@@ -86,6 +93,9 @@ final class Session {
     var snapshot: (() -> Data?)?
 
     private var build: LoadedBuild?
+    /// File name of the full build on screen; hot patches name the one they apply to.
+    private var baseFile: String?
+    private var patches: [LoadedBuild] = []
     private var loop: Task<Void, Never>?
     private var pendingCertificate: (p12: Data, password: String)?
     private var crashedKey: String?
@@ -206,6 +216,7 @@ final class Session {
         buildError = nil
         controller = nil
         build = nil
+        baseFile = nil
         loadError = nil
         phase = .unpaired
     }
@@ -416,26 +427,43 @@ final class Session {
                     try data.write(to: file)
                 }
             }
+            if let patch = state.patch, patch.baseFile != baseFile || build == nil {
+                // Not the build this patch applies to: the server sends a whole build when it sees that.
+                log("waiting for a whole build (have \(baseFile ?? "none"), patch is for \(patch.baseFile))", level: "warn")
+                return
+            }
             let (data, response) = try await request("GET", "/v1/dylib/\(state.version)", timeout: 60)
             guard response.statusCode == 200 else { return }  // superseded; the next poll brings the new one
-            let file = directory.appendingPathComponent("peek_\(state.version)_\(UUID().uuidString.prefix(8)).dylib")
+            let name = state.file ?? "peek_\(state.version)_\(UUID().uuidString.prefix(8)).dylib"
+            let file = directory.appendingPathComponent(name)
             try data.write(to: file)
             try await prepareResources(state.resources)
 
             defaults.set(buildKey, forKey: "loadingBuild")
+            if state.patch != nil, let build {
+                do {
+                    patches.append(try LoadedBuild(path: file.path, isPatch: true))
+                } catch {
+                    defaults.removeObject(forKey: "loadingBuild")
+                    log("hot patch \(state.version) failed to load: \(error.localizedDescription)", level: "patch-failed")
+                    return
+                }
+                build.bump()
+                loadError = nil
+                log("hot-patched build \(state.version) (\(data.count / 1024) KB)")
+                clearLoading(buildKey)
+                return
+            }
             let loaded = try LoadedBuild(path: file.path)
             build = loaded
+            baseFile = state.file
+            patches = []
             loadError = nil
             noteMemory()
             if rootIndex >= (state.roots?.count ?? 1) { rootIndex = 0 }
             showRoot()
             log("loaded build \(state.version) (\(data.count / 1024) KB)")
-            Task {
-                try? await Task.sleep(for: .seconds(3))
-                if defaults.string(forKey: "loadingBuild") == buildKey {
-                    defaults.removeObject(forKey: "loadingBuild")
-                }
-            }
+            clearLoading(buildKey)
         } catch {
             defaults.removeObject(forKey: "loadingBuild")
             if controller == nil {
@@ -446,6 +474,16 @@ final class Session {
             }
             log("load failed for build \(state.version): \(error.localizedDescription)", level: "error",
                 extra: ["diagnostics": Diagnostics.collect()])
+        }
+    }
+
+    /// Forgets the "loading" marker once the build has survived a few seconds on screen.
+    private func clearLoading(_ buildKey: String) {
+        Task {
+            try? await Task.sleep(for: .seconds(3))
+            if defaults.string(forKey: "loadingBuild") == buildKey {
+                defaults.removeObject(forKey: "loadingBuild")
+            }
         }
     }
 
@@ -522,6 +560,7 @@ final class Session {
         request.setValue(device, forHTTPHeaderField: "X-Peek-Device")
         request.setValue(PeekVersion.app, forHTTPHeaderField: "X-Peek-App")
         request.setValue(String(PeekVersion.proto), forHTTPHeaderField: "X-Peek-Protocol")
+        request.setValue(baseFile ?? "", forHTTPHeaderField: "X-Peek-Base")
         request.setValue(bundle, forHTTPHeaderField: "X-Peek-Bundle")
         if method == "POST" { request.httpBody = body }
         let (data, response) = try await http.data(for: request)

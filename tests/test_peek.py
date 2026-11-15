@@ -199,6 +199,59 @@ class Versions(unittest.TestCase):
         self.assertRegex(plist, rf"CFBundleShortVersionString</key>\s*<string>{re.escape(peek.VERSION)}</string>")
 
 
+class HotPatch(unittest.TestCase):
+    BASE = (
+        "import SwiftUI\n\n"
+        "struct ContentView: View {\n"
+        "    @State private var count = 0\n"
+        "    let title = \"Hi\"\n"
+        "    var body: some View {\n"
+        "        Button(\"\\(count)\") { count += 1 }\n"
+        "    }\n"
+        "    private func label(for value: Int, _ suffix: String = \"!\") -> String { String(value) + suffix }\n"
+        "}\n\n"
+        "extension ContentView where Self: Sendable {\n"
+        "    func extra() async throws -> Int { 2 }\n"
+        "}\n")
+
+    def patch(self, new):
+        return peek.patch_sources(self.BASE, new, "abc_ContentView.swift", 7)
+
+    def test_body_edit_becomes_replacement(self):
+        source, count = self.patch(self.BASE.replace("count += 1", "count += 2"))
+        self.assertEqual(count, 1)
+        self.assertIn('@_private(sourceFile: "abc_ContentView.swift") import PeekPreview', source)
+        self.assertIn("import SwiftUI", source)
+        self.assertIn("@_dynamicReplacement(for: body)", source)
+        self.assertIn("@SwiftUI.ViewBuilder", source)
+        self.assertIn("count += 2", source)
+
+    def test_function_selector_and_defaults(self):
+        source, _ = self.patch(self.BASE.replace("String(value) + suffix", "suffix + String(value)"))
+        self.assertIn("@_dynamicReplacement(for: label(for:_:))", source)
+        self.assertIn("private func __peekr7_label(for value: Int, _ suffix: String) -> String", source)
+
+    def test_constrained_extension_keeps_where(self):
+        source, _ = self.patch(self.BASE.replace("{ 2 }", "{ 3 }"))
+        self.assertIn("extension ContentView where Self: Sendable {", source)
+        self.assertIn("async throws -> Int", source)
+
+    def test_structural_edits_need_a_full_build(self):
+        self.assertIsNone(self.patch(self.BASE.replace('title = "Hi"', 'title = "Ho"')))
+        self.assertIsNone(self.patch(self.BASE.replace("    let title", "    var other = 1\n    let title")))
+        self.assertIsNone(self.patch(self.BASE.replace("func label(for value", "func label(at value")))
+
+    def test_comment_only_edit_outside_bodies_changes_nothing(self):
+        source, count = self.patch(self.BASE.replace("struct ContentView", "// hello\nstruct ContentView"))
+        self.assertEqual(count, 0)
+
+    def test_views_read_the_generation(self):
+        new, _, _ = peek.rewrite_source("struct A: View {\n var body: some View { Text(\"a\") }\n}\n"
+                                        "struct B: View, Equatable {\n var body: some View { Text(\"b\") }\n}\n")
+        self.assertIn("struct A: View { @SwiftUI.Environment(\\.__peekGeneration)", new)
+        self.assertNotIn("Equatable { @SwiftUI.Environment", new)
+
+
 class PackageEdits(unittest.TestCase):
     def test_only_dependency_sources(self):
         package = peek.Package.__new__(peek.Package)
@@ -283,6 +336,7 @@ class FakeSigner:
 
 class FakeBuilder:
     name = "Fake"
+    hot, base, force_full, patch_error = True, None, False, None
 
     def __init__(self, folder):
         self.folder = folder
@@ -323,7 +377,8 @@ class Server(unittest.TestCase):
 
     def call(self, method, path, body=b"", bundle="com.example.host", device="phone", tamper=None, extra=None):
         headers = {"X-Peek-Auth": peek.auth_header(TOKEN, method, path, body, bundle, device),
-                   "X-Peek-Bundle": tamper or bundle, "X-Peek-Device": device, **(extra or {})}
+                   "X-Peek-Bundle": tamper or bundle, "X-Peek-Device": device,
+                   "X-Peek-App": peek.VERSION, "X-Peek-Protocol": str(peek.PROTOCOL), **(extra or {})}
         request = urllib.request.Request(self.base + path, data=body if method == "POST" else None,
                                          method=method, headers=headers)
         with urllib.request.urlopen(request, timeout=10) as response:
@@ -399,15 +454,30 @@ class Server(unittest.TestCase):
         self.assertIn("gone", state["diagnostics"])
 
     def test_versions(self):
-        # 0.1.0 apps send no protocol header and speak protocol 1.
         state = json.loads(self.call("GET", "/v1/state?after=-1&wait=0"))
-        self.assertEqual(state["protocol"], peek.PROTOCOL)
-        ok = {"X-Peek-App": peek.VERSION, "X-Peek-Protocol": str(peek.PROTOCOL)}
-        self.assertEqual(json.loads(self.call("GET", "/v1/state?after=-1&wait=0", extra=ok))["peek"], peek.VERSION)
-        with self.assertRaises(urllib.error.HTTPError) as e:
-            self.call("GET", "/v1/state?after=-1&wait=0", extra={"X-Peek-App": "9.0", "X-Peek-Protocol": "9"})
-        self.assertEqual(e.exception.code, 426)
-        self.assertEqual(json.loads(e.exception.read())["peek"], peek.VERSION)
+        self.assertEqual((state["protocol"], state["peek"]), (peek.PROTOCOL, peek.VERSION))
+        # Other protocol numbers, including 0.1.x apps that send none (protocol 1), get a clear refusal.
+        for headers in ({"X-Peek-App": "9.0", "X-Peek-Protocol": "9"}, {"X-Peek-App": "0.1.0", "X-Peek-Protocol": "1"}):
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                self.call("GET", "/v1/state?after=-1&wait=0", extra=headers)
+            self.assertEqual(e.exception.code, 426)
+            self.assertEqual(json.loads(e.exception.read())["peek"], peek.VERSION)
+
+    def test_phone_without_the_base_build_gets_a_full_build(self):
+        self.call("GET", "/v1/state?after=-1&wait=0")  # the server learns the bundle identifier (one rebuild)
+        self.hub.publish({"status": "ready", "roots": ["A"], "file": "peek_x_2.dylib",
+                          "patch": {"base": 1, "baseFile": "peek_x_1.dylib"}}, self.hub.dylib, self.hub.deps)
+        before = self.hub.builder.builds
+        self.call("GET", "/v1/state?after=-1&wait=0", extra={"X-Peek-Base": "peek_x_1.dylib"})
+        time.sleep(0.3)
+        self.assertEqual(self.hub.builder.builds, before)
+        self.call("GET", "/v1/state?after=-1&wait=0", extra={"X-Peek-Base": ""})
+        for _ in range(20):
+            if self.hub.builder.builds > before:
+                break
+            time.sleep(0.1)
+        self.assertEqual(self.hub.builder.builds, before + 1)
+        self.assertNotIn("patch", self.hub.state)
 
     def test_output_is_accepted(self):
         body = json.dumps({"level": "print", "output": "hello\nworld\n"}).encode()

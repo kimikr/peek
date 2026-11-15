@@ -28,10 +28,10 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 # Bumped whenever the app and this server stop understanding each other. The app sends its
 # number in X-Peek-Protocol (0.1.0 sends none, which means 1); a mismatch gets a clear reply.
-PROTOCOL = 1
+PROTOCOL = 2
 STATE_DIR = Path(os.environ.get("PEEK_HOME", Path.home() / ".peek"))
 SKIP_DIRS = {".build", ".git", ".peek", "Tests", "xtool", "node_modules", ".swiftpm"}
 AUTH_WINDOW = 300  # seconds of clock skew tolerated on signed requests
@@ -230,6 +230,11 @@ VIEW_STRUCT_RE = re.compile(r"\bstruct\s+(\w+)\s*(?:<[^>{]*>)?\s*:\s*[^{]*\bView
 SCENE_RE = re.compile(r"\b(WindowGroup|Window|DocumentGroup|Settings|MenuBarExtra|ImmersiveSpace|UtilityWindow)\b")
 
 
+GENERATION_PROPERTY = " @SwiftUI.Environment(\\.__peekGeneration) private var __peekGeneration;"
+# Synthesized conformances that a hidden Environment property would break.
+SYNTHESIZED_RE = re.compile(r"\b(Equatable|Hashable|Codable|Encodable|Decodable|Comparable)\b")
+
+
 def _blank(text):
     """Keeps only the newlines of text, so line numbers stay the same."""
     return "\n" * text.count("\n")
@@ -335,7 +340,7 @@ def _rewrite_preview(src, m, name):
         break
     if not body_open:
         return None
-    head = f"struct {name}: SwiftUI.View {{" + _blank(src[m.start():i])  # keep line numbers stable
+    head = f"struct {name}: SwiftUI.View {{{GENERATION_PROPERTY}" + _blank(src[m.start():i])  # keep line numbers stable
     return m.start(), close + 1, head + "\n".join(lines) + "} } }", title
 
 
@@ -355,16 +360,213 @@ def rewrite_source(src, tag="0"):
         edits.append((m.start(), m.end(), " " * (m.end() - m.start())))
     for m in APP_RE.finditer(mask):
         app = _rewrite_app(src, mask, m, edits) or app
+    spans = []
     for m in PREVIEW_RE.finditer(mask):
         name = f"__PeekRoot_{tag}_{len(roots)}"
         found = _rewrite_preview(src, m, name)
         if found:
             start, end, text, title = found
             edits.append((start, end, text))
+            spans.append((start, end))
             roots.append((name, title))
+    # Every View struct reads the hot-patch generation, so a patch can make it re-render.
+    for m in VIEW_STRUCT_RE.finditer(mask):
+        if SYNTHESIZED_RE.search(m.group(0)) or any(a <= m.start() < b for a, b in spans):
+            continue
+        edits.append((m.end(), m.end(), GENERATION_PROPERTY))
+    if app:
+        opening = next(m for m in APP_RE.finditer(mask) if m.group(1) == app)
+        edits.append((opening.end(), opening.end(), GENERATION_PROPERTY))
     for start, end, text in sorted(edits, reverse=True):
         src = src[:start] + text + src[end:]
     return src, roots, app
+
+
+# ------------------------------------------------------------ hot patching
+#
+# A full build is compiled so that every function can be replaced later (implicit dynamic
+# replacement, as Xcode previews do). When an edit only changes the bodies of functions and
+# computed properties, peek compiles just those bodies into a small "patch" library made of
+# @_dynamicReplacement thunks. The phone loads it next to the running build, so views keep
+# their identity and their @State; every view then re-renders because it reads a generation
+# number from the environment that the patch bumps. Anything else falls back to a full build.
+
+HOT_FLAGS = ["-Xfrontend", "-enable-implicit-dynamic", "-Xfrontend", "-enable-private-imports",
+             "-Xfrontend", "-enable-dynamic-replacement-chaining", "-enable-testing"]
+_MODIFIER = (r"(?:@[A-Za-z_][\w.]*(?:\((?:[^()]|\([^()]*\))*\))?"
+             r"|(?:private|fileprivate|internal|public|open|package)(?:\s*\(\s*set\s*\))?"
+             r"|static|class|final|override|mutating|nonmutating|nonisolated|dynamic|lazy|required"
+             r"|convenience|optional|weak|unowned|distributed)")
+_PREFIX_RE = re.compile(rf"(?:{_MODIFIER}\s*)*$")
+_FUNC_RE = re.compile(r"\bfunc\s+([^\s(<]+)")
+_VAR_RE = re.compile(r"\bvar\s+([A-Za-z_]\w*)\s*:([^=]+?)\s*$", re.S)
+_TYPE_RE = re.compile(r"\b(struct|class|enum|extension|actor|protocol)\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)")
+_IMPORT_RE = re.compile(r"^[ \t]*(?:@[\w]+(?:\([^)\n]*\))?\s+)*import\s+(?:(?:struct|class|enum|protocol|func|var|typealias)\s+)?[\w.]+[ \t]*$", re.M)
+_DROPPED = {"private", "fileprivate", "internal", "public", "open", "package", "override", "final", "dynamic",
+            "required", "convenience", "lazy", "optional", "@objc", "@IBAction", "@IBOutlet", "@inlinable",
+            "@usableFromInline", "@nonobjc"}
+
+
+def comment_mask(src):
+    """Copy of src with only the comments blanked (string literals are kept)."""
+    out, i = list(src), 0
+    while i < len(src):
+        j = skip_trivia(src, i)
+        if j != i:
+            if src.startswith("//", i) or src.startswith("/*", i):
+                for k in range(i, j):
+                    if out[k] != "\n":
+                        out[k] = " "
+            i = j
+        else:
+            i += 1
+    return "".join(out)
+
+
+def swift_members(src):
+    """The functions and computed properties of a source file whose bodies a patch can replace.
+
+    Returns (skeleton, members). The skeleton is the file without those bodies (and without
+    comments); two versions of a file with the same skeleton differ only inside such bodies.
+    Each member is a dict: kind, name, prefix, signature, body, context, where.
+    """
+    mask, plain = code_mask(src), comment_mask(src)
+    members, cuts = [], []
+
+    def walk(start, end, context, where):
+        i = start
+        while True:
+            j = mask.find("{", i, end)
+            if j < 0:
+                return
+            close = match_close(src, j)
+            if close < 0 or close >= end:
+                return
+            head_start = max(start, *(mask.rfind(c, start, j) + 1 for c in ";{}"))
+            header = mask[head_start:j]
+            func, var, typ = _FUNC_RE.search(header), None, None
+            if not func and not re.search(r"\b(init|deinit|subscript)\b", header):
+                var = _VAR_RE.search(header)
+                if not var:
+                    typ = _TYPE_RE.search(header)
+            keyword = func or var
+            if keyword:
+                prefix = _PREFIX_RE.search(header[:keyword.start()])
+                lead = head_start + (prefix.start() if prefix else keyword.start())
+                members.append({
+                    "kind": "func" if func else "var", "name": keyword.group(1),
+                    "prefix": " ".join(plain[lead:head_start + keyword.start()].split()),
+                    "signature": (plain[head_start + keyword.end():j] if func else
+                                  plain[head_start + var.start(2):head_start + var.end(2)]).strip(),
+                    "body": src[j + 1:close], "context": context, "where": where,
+                })
+                cuts.append((j + 1, close))
+            elif typ and typ.group(1) != "protocol":
+                kind, name = typ.group(1), typ.group(2)
+                inner_where = None
+                if kind == "extension":
+                    w = re.search(r"\bwhere\b.*$", plain[head_start + typ.end():j], re.S)
+                    inner_where = " ".join(w.group(0).split()) if w else None
+                    inner = name
+                else:
+                    inner = f"{context}.{name}" if context else name
+                walk(j + 1, close, inner, inner_where)
+            i = close + 1
+
+    walk(0, len(src), None, None)
+    pieces, last = [], 0
+    for a, b in cuts:
+        pieces.append(plain[last:a])
+        last = b
+    pieces.append(plain[last:])
+    return " ".join("".join(pieces).split()), members
+
+
+def _split_top(text, sep=","):
+    """Splits text at sep characters that are not nested in brackets."""
+    parts, depth, current, i = [], 0, "", 0
+    while i < len(text):
+        c = text[i]
+        if text.startswith("->", i):
+            current += "->"
+            i += 2
+            continue
+        if c in "([<{":
+            depth += 1
+        elif c in ")]>}":
+            depth -= 1
+        if c == sep and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += c
+        i += 1
+    if current.strip():
+        parts.append(current)
+    return parts
+
+
+def replacement(member, n):
+    """Source of an @_dynamicReplacement thunk for member with its current body, or None."""
+    words = member["prefix"].split()
+    attrs = [w for w in words if w.startswith("@") and w.split("(")[0] not in _DROPPED]
+    mods = [w for w in words if not w.startswith("@") and w.split("(")[0] not in _DROPPED]
+    name, signature, body = member["name"], member["signature"], member["body"]
+    builder = name == "body" and "some" in signature and not any("Builder" in a for a in attrs)
+    if member["kind"] == "var":
+        target, decl = name, f"var __peekr{n}_{name}: {signature}"
+    else:
+        if not re.fullmatch(r"[A-Za-z_]\w*", name):
+            return None  # operators
+        generics = ""
+        rest = signature
+        if rest.startswith("<"):
+            close = rest.find(">")
+            generics, rest = rest[:close + 1], rest[close + 1:].lstrip()
+        if not rest.startswith("("):
+            return None
+        end = match_close(rest, 0)
+        if end < 0:
+            return None
+        params, labels = [], []
+        for param in _split_top(rest[1:end]):
+            param = _split_top(param, "=")[0].strip()
+            names = param.split(":", 1)[0].split()
+            if not names:
+                return None
+            labels.append(names[0])
+            params.append(param)
+        target = f"{name}({''.join(label + ':' for label in labels)})"
+        decl = f"func __peekr{n}_{name}{generics}({', '.join(params)}){rest[end + 1:]}"
+    lines = [f"@_dynamicReplacement(for: {target})"] + attrs + (["@SwiftUI.ViewBuilder"] if builder else [])
+    return "\n".join(lines) + "\n" + " ".join(["private", *mods, decl]) + " {" + body + "}"
+
+
+def patch_sources(old, new, file_name, n):
+    """Thunk source for a file edited from old to new, or None when it cannot be patched."""
+    old_skeleton, old_members = swift_members(old)
+    new_skeleton, new_members = swift_members(new)
+    if old_skeleton != new_skeleton or len(old_members) != len(new_members):
+        return None
+    groups = {}
+    for before, after in zip(old_members, new_members):
+        if before["body"] == after["body"]:
+            continue
+        text = replacement(after, n)
+        if text is None:
+            return None
+        groups.setdefault((after["context"], after["where"]), []).append(text)
+    imports = [line.strip() for line in _IMPORT_RE.findall(comment_mask(new))]
+    out = [f"// Generated by peek: hot patch for {file_name}",
+           f'@_private(sourceFile: "{file_name}") import PeekPreview', *imports, ""]
+    for (context, where), texts in groups.items():
+        body = "\n\n".join(texts)
+        if context is None:
+            out.append(body)
+        else:
+            out.append(f"extension {context}{' ' + where if where else ''} {{\n{body}\n}}")
+        out.append("")
+    return "\n".join(out), sum(len(t) for t in groups.values())
 
 
 ENTRY_TEMPLATE = """\
@@ -430,6 +632,37 @@ struct __PeekUIView: UIViewRepresentable {
         _ = delegate.application?(UIApplication.shared, didFinishLaunchingWithOptions: nil)
         return delegate
     }()
+}
+
+// Hot patches replace function bodies in the running build; bumping the generation makes every
+// view that reads it (peek adds the property to each View struct) evaluate its body again.
+@MainActor final class __PeekGeneration: ObservableObject {
+    static let shared = __PeekGeneration()
+    @Published var value = 0
+}
+
+struct __PeekGenerationKey: SwiftUI.EnvironmentKey {
+    static let defaultValue = 0
+}
+
+extension SwiftUI.EnvironmentValues {
+    var __peekGeneration: Int {
+        get { self[__PeekGenerationKey.self] }
+        set { self[__PeekGenerationKey.self] = newValue }
+    }
+}
+
+struct __PeekGenerationRoot<Content: SwiftUI.View>: SwiftUI.View {
+    @SwiftUI.ObservedObject private var generation = __PeekGeneration.shared
+    let content: Content
+    var body: some SwiftUI.View {
+        content.environment(\\.__peekGeneration, generation.value)
+    }
+}
+
+@_cdecl("peek_bump")
+public func __peekBump() {
+    MainActor.assumeIsolated { __PeekGeneration.shared.value += 1 }
 }
 
 // Scene modifiers have no meaning on a view; accept and ignore them.
@@ -638,6 +871,12 @@ class Builder:
         self.swift_version = args.swift_version
         self.extra = args.swiftc_flag or []
         self.incremental = not getattr(args, "no_incremental", False)
+        # Hot patching keeps view state across edits that only change function bodies.
+        self.hot = self.incremental and not getattr(args, "no_hot", False)
+        self.base = None  # the last full build, which patches apply to
+        self.force_full = False
+        self.patch_error = None
+        self.session = os.urandom(3).hex()  # build file names must not repeat while the app runs
         key = hashlib.sha1(str(target).encode()).hexdigest()[:12]
         self.out = STATE_DIR / "build" / key
         self.scratch = STATE_DIR / "spm" / key  # kept between runs: dependency builds are slow
@@ -853,7 +1092,7 @@ class Builder:
                         "Add `#Preview { MyView() }` or pass --root \"MyView()\"."}
             cases = [(f"{pick}()", pick)]
         body = "\n".join(
-            f"        case {i}: return UIHostingController(rootView: AnyView({expr}))"
+            f"        case {i}: return UIHostingController(rootView: AnyView(__PeekGenerationRoot(content: AnyView({expr}))))"
             for i, (expr, _) in enumerate(cases))
         bundle_name, resources = self.resources()
         support, entry = srcdir / "__PeekSupport.swift", srcdir / "__PeekEntry.swift"
@@ -863,13 +1102,28 @@ class Builder:
         for stale in srcdir.glob("*.swift"):
             if stale not in files:
                 stale.unlink()
+        shown = [(str(c), s) for c, s in inputs] + [(str(srcdir) + "/", "")]
+        language = self.swift_version or (self.package.language_mode if self.package else None) or "5"
+        snapshot = {f.name: f.read_text() for f in files}
+        resources_key = repr(self._stamp(p for _, p in resources)) + repr([a for a, _ in resources])
+        roots = [title for _, title in cases]
+        try:
+            deps = self.deps_library(sign_key)
+        except (RuntimeError, ValueError, OSError) as e:
+            return {"ok": False, "diagnostics": str(e), "seconds": time.time() - started}
+
+        if self.hot and self.base and not self.force_full:
+            patch = self._patch(version, snapshot, deps, resources_key, language, shown)
+            if patch:
+                patch.update(roots=self.base["roots"], resources=resources, deps=deps,
+                             seconds=time.time() - started)
+                return patch
 
         output_map = {"": {"swift-dependencies": str(objdir / "module.swiftdeps")}}
         for f in files:
             output_map[str(f)] = {"object": str(objdir / f"{f.stem}.o"),
                                   "swift-dependencies": str(objdir / f"{f.stem}.swiftdeps")}
         write_if_changed(self.out / "output-file-map.json", json.dumps(output_map, indent=1))
-        language = self.swift_version or (self.package.language_mode if self.package else None) or "5"
         module = "PeekPreview" if self.incremental else f"PeekBuild{version}"
         if not self.incremental:
             for old in objdir.glob("*"):
@@ -881,35 +1135,81 @@ class Builder:
                "-j", str(os.cpu_count() or 2), "-output-file-map", str(self.out / "output-file-map.json")]
         if self.incremental:
             cmd.append("-incremental")
-        if self.package:
-            cmd += ["-package-name", self.package.identity, *self.package.swift_flags, *self.package.macro_plugins()]
-        cmd += self.extra + [str(f) for f in files]
+        if self.hot:
+            (self.out / "module").mkdir(exist_ok=True)
+            cmd += HOT_FLAGS + ["-emit-module", "-emit-module-path", str(self.out / "module/PeekPreview.swiftmodule")]
+        cmd += self._package_flags() + self.extra + [str(f) for f in files]
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=self.out)
-        shown = [(str(c), s) for c, s in inputs] + [(str(srcdir) + "/", "")]
         output = self._clean(proc.stdout + proc.stderr, shown)
         objects = [objdir / f"{f.stem}.o" for f in files]
-        deps = None
+        name = f"peek_{self.session}_{version}.dylib"
+        dylib = self.out / name
         if proc.returncode == 0:
-            try:
-                deps = self.deps_library(sign_key)
-            except (RuntimeError, ValueError, OSError) as e:
-                output, proc = str(e), None
-        dylib = self.out / f"peek_{version}.dylib"
-        if proc is not None and proc.returncode == 0:
             link = [self.tc.swiftc, "-emit-library", *self._common_flags(), *self._link_flags(),
+                    "-Xlinker", "-install_name", "-Xlinker", f"@loader_path/{name}",
                     *map(str, objects), *([str(deps[1])] if deps else []), "-o", str(dylib)]
             proc = subprocess.run(link, capture_output=True, text=True, cwd=self.out)
             output = (output + "\n" + self._clean(proc.stdout + proc.stderr, shown)).strip()
         elapsed = time.time() - started
-        if proc is None or proc.returncode != 0 or not dylib.exists():
+        if proc.returncode != 0 or not dylib.exists():
             if self.package_error and "error:" not in output:
                 output = self.package_error + "\n\n" + output
             return {"ok": False, "diagnostics": output.strip() or "swiftc failed", "seconds": elapsed}
-        for old in self.out.glob("peek_*.dylib"):
-            if not old.name.startswith(f"peek_{version}.") and old != dylib and old.stat().st_mtime < time.time() - 600:
-                old.unlink()
-        return {"ok": True, "dylib": dylib, "roots": [title for _, title in cases], "seconds": elapsed,
+        self.base = {"version": version, "file": name, "snapshot": snapshot, "roots": roots,
+                     "deps": deps[0] if deps else None, "resources": resources_key} if self.hot else None
+        self._clean_old_builds(keep={dylib})
+        return {"ok": True, "dylib": dylib, "file": name, "roots": roots, "seconds": elapsed,
                 "resources": resources, "deps": deps}
+
+    def _package_flags(self):
+        if not self.package:
+            return []
+        return ["-package-name", self.package.identity, *self.package.swift_flags, *self.package.macro_plugins()]
+
+    def _clean_old_builds(self, keep):
+        keep = set(keep) | ({self.out / self.base["file"]} if self.base else set())
+        for old in self.out.glob("peek_*.dylib"):
+            if old not in keep and old.with_name(old.name.replace(".signed", "")) not in keep \
+                    and old.stat().st_mtime < time.time() - 600:
+                old.unlink()
+
+    def _patch(self, version, snapshot, deps, resources_key, language, shown):
+        """A patch library on top of the last full build, or None when this edit needs a full build."""
+        base = self.base
+        if (set(snapshot) != set(base["snapshot"]) or (deps[0] if deps else None) != base["deps"]
+                or resources_key != base["resources"]):
+            return None
+        changed = [f for f in snapshot if snapshot[f] != base["snapshot"][f]]
+        if not changed or any(f.startswith("__Peek") for f in changed):
+            return None
+        sources = []
+        for f in changed:
+            made = patch_sources(base["snapshot"][f], snapshot[f], f, version)
+            if made is None or not made[1]:
+                return None
+            sources.append(made[0])
+        folder = self.out / "patch"
+        shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir()
+        thunks = []
+        for i, text in enumerate(sources):
+            thunks.append(folder / f"thunk_{i}.swift")
+            thunks[-1].write_text(text)
+        name = f"peek_{self.session}_{version}.dylib"
+        dylib = self.out / name
+        cmd = [self.tc.swiftc, "-emit-library", "-parse-as-library", "-Onone", "-module-name", f"PeekPatch{version}",
+               "-swift-version", language, *self._common_flags(), "-I", str(self.out / "module"),
+               "-Xfrontend", "-enable-cross-import-overlays", "-D", "DEBUG", "-D", "PEEK", "-suppress-warnings",
+               *self._package_flags(), *self.extra, *self._link_flags(),
+               "-Xlinker", "-install_name", "-Xlinker", f"@loader_path/{name}",
+               *map(str, thunks), str(self.out / base["file"]), *([str(deps[1])] if deps else []), "-o", str(dylib)]
+        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=self.out)
+        if proc.returncode != 0 or not dylib.exists():
+            self.patch_error = self._clean(proc.stdout + proc.stderr, shown)
+            return None
+        self._clean_old_builds(keep={dylib})
+        return {"ok": True, "dylib": dylib, "file": name,
+                "patch": {"base": base["version"], "baseFile": base["file"]}}
 
 
 def unpack_object(path, folder):
@@ -1523,6 +1823,28 @@ class Hub:
             elif not self.builder.package:
                 log(self.builder.package_error, "red")
 
+    def full_rebuild(self, reason):
+        """Builds everything again (no patch), e.g. for a phone that does not have the base build."""
+        with self.lock:
+            if not self.state.get("patch"):
+                return
+            log(f"full build: {reason}", "dim")
+            self.builder.force_full = True
+            try:
+                self._rebuild()
+            finally:
+                self.builder.force_full = False
+
+    def patch_failed(self, message):
+        """The phone could not load a patch: stop patching for this session and send a full build."""
+        if not self.builder.hot:
+            return
+        self.builder.hot = False
+        self.builder.base = None
+        log(f"the phone could not load a hot patch ({message}); reloading whole builds from now on", "yellow")
+        with self.lock:
+            self._rebuild()
+
     def _rebuild(self):
         version = self.version + 1
         try:
@@ -1530,6 +1852,9 @@ class Hub:
         except Exception as e:
             result = {"ok": False, "diagnostics": f"peek: build crashed: {type(e).__name__}: {e}"}
         self.built = result["ok"]
+        if self.builder.patch_error:
+            log("hot patch not possible, built everything instead", "dim")
+            self.builder.patch_error = None
         if not result["ok"]:
             log(f"build failed ({result.get('seconds', 0):.1f}s)", "red")
             print(result["diagnostics"], flush=True)
@@ -1539,7 +1864,9 @@ class Hub:
 
     def finish(self, result):
         """Sign (if possible) and publish a successful build."""
-        state = {"roots": result["roots"], "seconds": round(result["seconds"], 2)}
+        state = {"roots": result["roots"], "seconds": round(result["seconds"], 2), "file": result.get("file")}
+        if result.get("patch"):
+            state["patch"] = result["patch"]
         if result.get("resources"):
             stamp = Builder._stamp(p for _, p in result["resources"]) + tuple(a for a, _ in result["resources"])
             rid = hashlib.sha1(repr(stamp).encode()).hexdigest()[:16]
@@ -1564,7 +1891,10 @@ class Hub:
             log(str(e), "red")
             self.publish({"status": "error", "diagnostics": f"Signing failed: {e}"})
             return
-        log(f"built + signed in {result['seconds']:.1f}s → v{self.version + 1} ({', '.join(result['roots'])})", "green")
+        if result.get("patch"):
+            log(f"hot-patched in {result['seconds']:.1f}s → v{self.version + 1} (state kept)", "green")
+        else:
+            log(f"built + signed in {result['seconds']:.1f}s → v{self.version + 1} ({', '.join(result['roots'])})", "green")
         self.publish({"status": "ready", "size": signed.stat().st_size, **state}, signed, deps)
 
     def resign(self):
@@ -1678,6 +2008,10 @@ def make_handler(hub):
             hub.devices[name] = {"seen": time.time(), "app": app, "address": self.client_address[0]}
             hub.save_devices()
             hub.adopt(self.headers.get("X-Peek-Bundle"))
+            patch = hub.state.get("patch")
+            if patch and self.headers.get("X-Peek-Base", "") != patch["baseFile"]:
+                # This phone does not have the build the current patch applies to.
+                threading.Thread(target=hub.full_rebuild, args=(f"{name} needs a whole build",), daemon=True).start()
             return True
 
         def do_GET(self):
@@ -1747,6 +2081,9 @@ def make_handler(hub):
                 try:
                     entry = json.loads(body)
                     level = entry.get("level", "info")
+                    if level == "patch-failed":
+                        threading.Thread(target=hub.patch_failed, args=(printable(entry.get("message", "")),),
+                                         daemon=True).start()
                     if entry.get("output"):  # print() and stderr of the previewed code
                         for line in str(entry["output"]).rstrip("\n").split("\n"):
                             log(f"│ {printable(line)}", "dim" if level != "crash" else "red")
@@ -2104,6 +2441,7 @@ def main():
         p.add_argument("--ios", help="deployment target (default: from Package.swift, else 17.0)")
         p.add_argument("--swift-version", help="Swift language mode (default: from Package.swift, else 5)")
         p.add_argument("--no-incremental", action="store_true", help="compile everything on every change, as a new module")
+        p.add_argument("--no-hot", action="store_true", help="always reload the whole build (state resets on every edit)")
         p.add_argument("--swiftc-flag", action="append", help="extra flag passed to swiftc (repeatable)")
 
     dev = sub.add_parser("dev", help="watch, build and serve previews to the phone")
