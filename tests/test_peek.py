@@ -187,6 +187,19 @@ class Hardening(unittest.TestCase):
         self.assertEqual(package.link_flags, ["-Xlinker", "-x"])
 
 
+class PackageEdits(unittest.TestCase):
+    def test_only_dependency_sources(self):
+        package = peek.Package.__new__(peek.Package)
+        package.dep_dirs = [Path("/p/Sources/Shared"), Path("/p/Packages/Forecast")]
+        only = package.only_dependency_sources
+        self.assertTrue(only([Path("/p/Sources/Shared/Models.swift")]))
+        self.assertTrue(only([Path("/p/Packages/Forecast/Sources/Forecast/A.swift")]))
+        self.assertFalse(only([Path("/p/Package.swift")]))
+        self.assertFalse(only([Path("/p/Sources/Shared/Resources/a.png")]))
+        self.assertFalse(only([Path("/p/Sources/Shared/Models.swift"), Path("/p/Package.resolved")]))
+        self.assertFalse(only([]))
+
+
 class Archive(unittest.TestCase):
     def test_unpack_bsd_archive(self):
         with tempfile.TemporaryDirectory() as tmp:

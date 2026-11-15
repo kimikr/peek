@@ -94,11 +94,12 @@ class Toolchain:
         if missing:
             sys.exit("peek: missing " + ", ".join(missing))
 
-    def swift_build(self, package_dir, scratch):
+    def swift_build(self, package_dir, scratch, extra=()):
         """Builds a package for iOS the way xtool does (SwiftPM's swiftbuild backend)."""
         swift = Path(self.swiftc).with_name("swift")
         cmd = [str(swift) if swift.exists() else "swift", "build", "--configuration", "debug",
-               "--build-system", "swiftbuild", "--triple", "arm64-apple-ios", "--scratch-path", str(scratch)]
+               "--build-system", "swiftbuild", "--triple", "arm64-apple-ios", "--scratch-path", str(scratch),
+               *extra]
         for name in ("toolset-swb.json", "toolset.json"):
             if (self.bundle / name).exists():
                 cmd += ["--toolset", str(self.bundle / name)]
@@ -496,6 +497,12 @@ class Package:
         # Objects that must not be linked: the previewed module itself and unrelated local targets.
         self.excluded = {t["c99name"] for name, t in targets.items() if name not in needed}
         self.local_deps = [Path(d["path"]) for d in info.get("dependencies", []) if d.get("type") == "fileSystem"]
+        # What the previewed target depends on directly, and where those sources live: an edit
+        # there only needs these built, not the previewed target (peek compiles that itself).
+        self.direct_targets = [t for t in target.get("target_dependencies") or [] if t in targets]
+        self.direct_products = list(target.get("product_dependencies") or [])
+        self.dep_dirs = [(root / targets[n]["path"]).resolve() for n in needed if n in targets] \
+            + [d.resolve() for d in self.local_deps]
         # SwiftPM names the root package after its folder; `package` declarations need the same name.
         self.identity = root.name.lower()
         self.settings(swift, wanted)
@@ -545,10 +552,21 @@ class Package:
             elif kind == "linkedLibrary":
                 self.link_flags += [f"-l{value}"]
 
-    def build(self):
-        proc = self.tc.swift_build(self.root, self.scratch)
-        lines = [l for l in (proc.stdout + proc.stderr).splitlines() if not re.fullmatch(r"\[\d+ / \d+\].*", l)]
-        return proc.returncode == 0, "\n".join(lines).strip()
+    def build(self, dependencies_only=False):
+        """Builds the package; with dependencies_only, just what the previewed target depends on."""
+        runs = [()]
+        if dependencies_only:
+            runs = [("--target", t) for t in self.direct_targets] + [("--product", p) for p in self.direct_products]
+        output, ok = [], True
+        for extra in runs:
+            proc = self.tc.swift_build(self.root, self.scratch, extra)
+            output += [l for l in (proc.stdout + proc.stderr).splitlines() if not re.fullmatch(r"\[\d+ / \d+\].*", l)]
+            ok = ok and proc.returncode == 0
+        return ok, "\n".join(output).strip()
+
+    def only_dependency_sources(self, paths):
+        """True when every changed path is a Swift source of a dependency."""
+        return bool(paths) and all(p.suffix == ".swift" and any(d in p.parents for d in self.dep_dirs) for p in paths)
 
     def objects(self):
         return [o for o in sorted(self.products.glob("*.o")) if o.stem not in self.excluded]
@@ -715,9 +733,17 @@ class Builder:
 
     # -- building
 
-    def prepare_package(self):
-        """Resolves and builds the package's dependencies. Slow; runs when the manifest or a dependency changes."""
+    def prepare_package(self, changed=None):
+        """Resolves and builds the package's dependencies. Slow; runs when the manifest or a dependency changes.
+
+        When only dependency sources changed, the manifest is not read again and only the
+        dependencies are rebuilt."""
         self.package_error = None
+        if self.package and changed and self.package.only_dependency_sources(changed):
+            ok, output = self.package.build(dependencies_only=True)
+            if not ok:
+                self.package_error = output
+            return ok
         try:
             self.package = Package(self.root, self.tc, self.wanted_target, self.scratch)
         except (ValueError, OSError) as e:
@@ -1471,11 +1497,11 @@ class Hub:
         with self.lock:
             self._rebuild()
 
-    def refresh_package(self):
+    def refresh_package(self, changed=None):
         with self.lock:
             log("building package dependencies…", "dim")
             started = time.time()
-            ok = self.builder.prepare_package()
+            ok = self.builder.prepare_package(changed)
             if ok:
                 log(f"dependencies ready ({time.time() - started:.1f}s)", "dim")
             elif not self.builder.package:
@@ -1832,7 +1858,10 @@ def cmd_dev(args):
                 if seen is not None:
                     time.sleep(0.05)  # let editors finish writing
                 if package != seen_package:
-                    hub.refresh_package()
+                    before = {entry[0]: entry[1:] for entry in seen_package or ()}
+                    after = {entry[0]: entry[1:] for entry in package or ()}
+                    changed = [Path(p) for p in set(before) | set(after) if before.get(p) != after.get(p)]
+                    hub.refresh_package(changed if seen_package is not None else None)
                 # Read again: the dependency build may create files (Package.resolved, bundles).
                 seen_package, seen = builder.package_fingerprint(), builder.fingerprint()
                 hub.rebuild()
