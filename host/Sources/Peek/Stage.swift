@@ -11,9 +11,7 @@ final class Stage {
     private var window: UIWindow?
     private var handle: HandleWindow?
     private weak var errorSheet: UIViewController?
-    /// Overrides Peek put on the preview's root. Only those are removed again: SwiftUI stores the
-    /// app's own `.preferredColorScheme` there too.
-    private var overridesStyle = false
+    /// Whether Peek put a text size override on the preview's root (only that one is removed again).
     private var overridesSize = false
 
     private var scene: UIWindowScene? {
@@ -35,8 +33,7 @@ final class Stage {
         if window.rootViewController !== controller {
             window.rootViewController?.dismiss(animated: false)
             window.rootViewController = controller
-            overridesStyle = false  // a fresh controller carries none of ours
-            overridesSize = false
+            overridesSize = false  // a fresh controller carries none of ours
         }
         window.makeKeyAndVisible()
         self.window = window
@@ -53,17 +50,13 @@ final class Stage {
 
     /// Light or dark appearance and text size chosen in the menu, applied to the preview only.
     ///
-    /// Overrides go on the root controller, not the window, so system pop-up menus keep the
-    /// phone's settings. Peek's own sheets reset them in `present`.
+    /// Appearance goes on the window, like the phone's own setting, so an app's
+    /// `.preferredColorScheme` (an override on its root controller) still wins. Text size goes on
+    /// the root controller so system pop-up menus keep the phone's size. Peek's own sheets reset
+    /// both in `present`.
     func applyDisplay(_ session: Session, report: Bool = false) {
         guard let window, let controller = window.rootViewController else { return }
-        if session.appearance != .system {
-            controller.traitOverrides.userInterfaceStyle = session.appearance.style
-            overridesStyle = true
-        } else if overridesStyle {
-            controller.traitOverrides.remove(UITraitUserInterfaceStyle.self)
-            overridesStyle = false
-        }
+        window.overrideUserInterfaceStyle = session.appearance == .system ? .unspecified : session.appearance.style
         if let category = session.textSize.category {
             controller.traitOverrides.preferredContentSizeCategory = category
             overridesSize = true
@@ -74,7 +67,7 @@ final class Stage {
         // Trait changes reach the preview on the next layout pass, so read them back after it.
         if report { DispatchQueue.main.async { [weak window, weak session] in
             guard let window, let session else { return }
-            let now = window.rootViewController?.traitCollection
+            let now = window.rootViewController?.traitCollection  // after the app's own override
             session.log("display: \(session.appearance.rawValue), text \(session.textSize.rawValue) → preview sees "
                         + "style \(now?.userInterfaceStyle.rawValue ?? -1), size \(now?.preferredContentSizeCategory.rawValue ?? "?")")
         } }
