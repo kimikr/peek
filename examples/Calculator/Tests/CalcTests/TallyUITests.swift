@@ -52,7 +52,7 @@ final class TallyUITests: XCTestCase {
         let app = XCUIApplication()
         app.launch()
         let pad = app.otherElements["pad"]
-        for _ in 0..<10 where !(pad.exists && pad.isHittable) { app.swipeUp(velocity: .slow) }  // below the first screen
+        for _ in 0..<10 where !pad.exists { app.swipeUp(velocity: .slow) }  // below the first screen (a container is never "hittable")
         pad.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.5)).tap()
         XCTAssertEqual(app.staticTexts["side"].label, "Tap: right")
         pad.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.5)).tap()
@@ -63,7 +63,7 @@ final class TallyUITests: XCTestCase {
         let app = XCUIApplication()
         app.launch()
         let pad = app.otherElements["pad"]
-        for _ in 0..<10 where !(pad.exists && pad.isHittable) { app.swipeUp(velocity: .slow) }  // below the first screen
+        for _ in 0..<10 where !pad.exists { app.swipeUp(velocity: .slow) }  // below the first screen (a container is never "hittable")
         pad.pinch(withScale: 2, velocity: 1)
         pad.rotate(.pi / 2, withVelocity: 1)
         let label = app.staticTexts["zoom"].label  // "Zoom: 2.0, angle: 90"
