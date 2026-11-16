@@ -791,6 +791,17 @@ TEST_RUNNER_SOURCE = """
 import Testing
 
 let __peekRelaunchNotification = Notification.Name("peek.uitest.relaunch")
+let __peekNoticeNotification = Notification.Name("peek.test.notice")
+/// Only tests whose "Suite/test" name matches this (with `peek test --filter`).
+let __peekTestFilter: String = %FILTER%
+/// XCTest cases that failed in this run, shown on the phone.
+nonisolated(unsafe) var __peekFailedTests: [String] = []
+
+/// Shows a line on the phone while tests run (nil clears it), and lets the screen update.
+@MainActor func __peekNotice(_ text: String?) {
+    NotificationCenter.default.post(name: __peekNoticeNotification, object: text)
+    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+}
 
 struct __PeekTestRunner: SwiftUI.View {
     /// The app under UI tests: shown full screen while they drive it. nil for unit tests only.
@@ -799,6 +810,8 @@ struct __PeekTestRunner: SwiftUI.View {
     @SwiftUI.State private var started = Date()
     @SwiftUI.State private var seconds = 0.0
     @SwiftUI.State private var launches = 0
+    @SwiftUI.State private var notice: String?
+    @SwiftUI.State private var failed: [String] = []
 
     var body: some SwiftUI.View {
         SwiftUI.Group {
@@ -811,25 +824,40 @@ struct __PeekTestRunner: SwiftUI.View {
                 summary
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: __peekNoticeNotification)) { notice = $0.object as? String }
         .task { await run() }
     }
 
     private var status: some SwiftUI.View {
-        SwiftUI.Text(result == nil ? "Running UI tests…" : result == 0 ? "All tests passed" : "Some tests failed")
-            .font(.caption.bold())
-            .padding(.horizontal, 10).padding(.vertical, 4)
-            .background(SwiftUI.Capsule().fill(result == nil ? SwiftUI.Color.gray : result == 0 ? SwiftUI.Color.green : SwiftUI.Color.red))
-            .foregroundStyle(SwiftUI.Color.white)
-            .padding(.top, 4)
+        SwiftUI.VStack(spacing: 4) {
+            SwiftUI.Text(notice ?? (result == nil ? "Running UI tests…" : result == 0 ? "All tests passed" : "Some tests failed"))
+                .font(.caption.bold())
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 10).padding(.vertical, 4)
+                .background(SwiftUI.Capsule().fill(notice != nil ? SwiftUI.Color.orange : result == nil ? SwiftUI.Color.gray
+                                                   : result == 0 ? SwiftUI.Color.green : SwiftUI.Color.red))
+                .foregroundStyle(SwiftUI.Color.white)
+            if result != nil, !failed.isEmpty {
+                SwiftUI.Text(failed.prefix(5).joined(separator: "\\n") + (failed.count > 5 ? "\\n…" : ""))
+                    .font(.caption2.monospaced())
+                    .padding(6)
+                    .background(SwiftUI.RoundedRectangle(cornerRadius: 8).fill(.regularMaterial))
+            }
+        }
+        .padding(.top, 4)
     }
 
     private var summary: some SwiftUI.View {
         SwiftUI.VStack(spacing: 16) {
+            if let notice {
+                SwiftUI.Text(notice).font(.callout).multilineTextAlignment(.center).foregroundStyle(SwiftUI.Color.orange)
+            }
             if let result {
                 SwiftUI.Image(systemName: result == 0 ? "checkmark.circle.fill" : "xmark.octagon.fill")
                     .font(.system(size: 64))
                     .foregroundStyle(result == 0 ? SwiftUI.Color.green : SwiftUI.Color.red)
                 SwiftUI.Text(result == 0 ? "All tests passed" : "Some tests failed").font(.title2.bold())
+                SwiftUI.ForEach(failed.prefix(8), id: \\.self) { SwiftUI.Text($0).font(.footnote.monospaced()).foregroundStyle(SwiftUI.Color.red) }
                 SwiftUI.Text(String(format: "%.2f s · details in the terminal", seconds)).foregroundStyle(.secondary)
             } else {
                 SwiftUI.ProgressView().controlSize(.large)
@@ -857,11 +885,13 @@ struct __PeekTestRunner: SwiftUI.View {
             }
             let code = await Task.detached { () -> CInt in
                 var arguments = __CommandLineArguments_v0()
-                arguments.filter = ["^\\(module)\\\\."]  // this build's tests, not those of earlier builds
+                // This build's tests, not those of earlier builds (and only the filtered ones).
+                arguments.filter = ["^\\(module)\\\\." + (__peekTestFilter.isEmpty ? "" : ".*(?:\\(__peekTestFilter))")]
                 return await __swiftPMEntryPoint(passing: arguments)
             }.value
             seconds = Date().timeIntervalSince(started)
             let swiftTesting = code == 69 ? 0 : code  // 69: no Swift Testing tests in this target
+            failed = __peekFailedTests
             result = xctestPassed ? swiftTesting : max(swiftTesting, 1)
             print(result == 0 ? "peek: all tests passed" : "peek: tests failed")
     }
@@ -899,6 +929,19 @@ let __peekTargetBundleIdentifier = %TARGETBUNDLE%
         if parent != nil { classes.append(candidate) }
     }
     if classes.isEmpty { return true }
+    let suite = XCTestSuite(name: "All tests")
+    let filter = __peekTestFilter.isEmpty ? nil : try? NSRegularExpression(pattern: __peekTestFilter)
+    for testClass in classes.sorted(by: { NSStringFromClass($0) < NSStringFromClass($1) }) {
+        let classSuite = XCTestSuite(forTestCaseClass: testClass)
+        guard let filter else { suite.addTest(classSuite); continue }
+        let matching = XCTestSuite(name: classSuite.name)
+        for test in classSuite.tests {
+            let name = __peekTestName(test)
+            if filter.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)) != nil { matching.addTest(test) }
+        }
+        if matching.testCaseCount > 0 { suite.addTest(matching) }
+    }
+    if suite.testCaseCount == 0 { return true }
     if __peekUsesUITesting {
         __peekPrepareUITesting()
         __peekStartAccessibility()
@@ -906,13 +949,25 @@ let __peekTargetBundleIdentifier = %TARGETBUNDLE%
     } else {
         __peekWithoutTestDaemon()
     }
-    let suite = XCTestSuite(name: "All tests")
-    for testClass in classes.sorted(by: { NSStringFromClass($0) < NSStringFromClass($1) }) {
-        suite.addTest(XCTestSuite(forTestCaseClass: testClass))
-    }
+    let observer = __PeekFailureObserver()
+    XCTestObservationCenter.shared.addTestObserver(observer)
     suite.run()
+    XCTestObservationCenter.shared.removeTestObserver(observer)
     if __peekUsesUITesting { __PeekBackgroundKeeper.shared.stop() }
     return suite.testRun?.hasSucceeded ?? false
+}
+
+/// "Class/method" for "-[Module.Class method]".
+func __peekTestName(_ test: XCTest) -> String {
+    let parts = test.name.trimmingCharacters(in: CharacterSet(charactersIn: "-[]")).split(separator: " ")
+    let type = parts.first.map { $0.split(separator: ".").last.map(String.init) ?? String($0) } ?? test.name
+    return parts.count > 1 ? "\\(type)/\\(parts[1])" : type
+}
+
+final class __PeekFailureObserver: NSObject, XCTestObservation {
+    func testCaseDidFinish(_ testCase: XCTestCase) {
+        if let run = testCase.testRun, !run.hasSucceeded { __peekFailedTests.append(__peekTestName(testCase)) }
+    }
 }
 
 /// UI tests (XCUIApplication) need testmanagerd, which the developer disk image brings (mount
@@ -921,6 +976,7 @@ let __peekTargetBundleIdentifier = %TARGETBUNDLE%
 @MainActor func __peekPrepareUITesting() {
     guard FileManager.default.fileExists(atPath: "/System/Developer/usr/libexec/testmanagerd") else {
         print("peek: UI tests need the developer disk image (testmanagerd); mount it with StikDebug, then reopen Peek")
+        __peekNotice("UI tests need the developer disk image.\\nMount it with StikDebug, then reopen Peek.")
         return
     }
     if let session = NSClassFromString("XCTRunnerDaemonSession"),
@@ -932,10 +988,12 @@ let __peekTargetBundleIdentifier = %TARGETBUNDLE%
         let config = configClass.init()
         config.setValue(true, forKey: "initializeForUITesting")
         // XCUIApplication() is the app being previewed, which is this very process: iOS knows it
-        // by the bundle identifier of the app hosting Peek (LiveContainer's, say).
-        config.setValue(__peekTargetBundleIdentifier, forKey: "targetApplicationBundleID")
-        let executable = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().path
-        config.setValue(executable, forKey: "targetApplicationPath")
+        // by the bundle identifier of the app hosting Peek (LiveContainer's, say), whose
+        // Info.plist sits next to the executable.
+        let executable = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
+        let host = NSDictionary(contentsOf: executable.appendingPathComponent("Info.plist"))?["CFBundleIdentifier"] as? String
+        config.setValue(host ?? __peekTargetBundleIdentifier, forKey: "targetApplicationBundleID")
+        config.setValue(executable.path, forKey: "targetApplicationPath")
         _ = (configClass as AnyObject).perform(NSSelectorFromString("setActiveTestConfiguration:"), with: config)
     }
     // launch() would terminate the app, i.e. Peek: start the preview afresh instead.
@@ -1005,6 +1063,8 @@ let __peekTargetBundleIdentifier = %TARGETBUNDLE%
     guard let method = class_getInstanceMethod(object_getClass(device), selector) else { return }
     typealias Enable = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<NSError?>?) -> Bool
     var error: NSError?
+    __peekNotice("Enter your passcode to allow Automation Mode for the UI tests")
+    defer { __peekNotice(isEnabled?() == true ? nil : "Automation Mode is off, so UI tests cannot drive the app") }
     let ok = unsafeBitCast(method_getImplementation(method), to: Enable.self)(device, selector, &error)
     print("peek: Automation Mode \(ok ? "requested" : "not enabled: \(error?.localizedDescription ?? "unknown error")")")
     // The passcode prompt may still be up; wait for the mode to actually switch on.
@@ -1826,6 +1886,7 @@ class Builder:
         self.incremental = not getattr(args, "no_incremental", False)
         # Hot patching keeps view state across edits that only change function bodies.
         self.tests = getattr(args, "tests", False)  # run the test targets on the phone instead of previews
+        self.test_filter = getattr(args, "filter", None)  # regular expression on "Suite/test" names
         if self.tests:
             # Earlier builds stay loaded and Swift Testing finds tests in every loaded image, so
             # each build gets a module of its own and the runner only runs that module's tests.
@@ -2180,7 +2241,8 @@ class Builder:
         write_if_changed(support, SUPPORT_SOURCE + (BUNDLE_TEMPLATE.replace("%NAME%", bundle_name) if bundle_name else "")
                          + colors_source(self.colors)
                          + ("" if own_symbols else asset_symbols_source(self.colors, self.images, bool(bundle_name)))
-                         + (TEST_RUNNER_SOURCE.replace("%XCTEST%", XCTEST_RUNNER.replace("%UITESTS%", "true" if self.uses_ui_tests else "false")
+                         + (TEST_RUNNER_SOURCE.replace("%FILTER%", json.dumps(self.test_filter or "", ensure_ascii=False))
+                            .replace("%XCTEST%", XCTEST_RUNNER.replace("%UITESTS%", "true" if self.uses_ui_tests else "false")
                                                     .replace("%TARGETBUNDLE%", json.dumps(self.target_bundle_identifier()))
                                                     if self.uses_xctest else XCTEST_NONE)
                             if self.tests else ""))
@@ -3641,11 +3703,13 @@ def main():
     test.add_argument("--bind", help="address to listen on (default: the addresses in the pairing link, and loopback)")
     test.add_argument("--host", action="append", help="address to advertise in the pairing link (repeatable)")
     test.add_argument("--no-discovery", action="store_true", help="do not advertise the server with Bonjour")
+    test.add_argument("--filter", help='run only tests whose "Suite/test" name matches this regular expression')
     test.set_defaults(func=cmd_dev, tests=True)
 
     build = sub.add_parser("build", help="compile once and report errors (no server)")
     common(build)
     build.add_argument("--tests", action="store_true", help="build the test runner instead of the previews")
+    build.add_argument("--filter", help='with --tests: run only tests whose "Suite/test" name matches this')
     build.set_defaults(func=cmd_build)
 
     cert = sub.add_parser("cert", help="install the signing certificate from a .p12 file")

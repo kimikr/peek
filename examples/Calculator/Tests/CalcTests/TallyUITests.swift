@@ -32,7 +32,7 @@ final class TallyUITests: XCTestCase {
         app.buttons["Add"].press(forDuration: 1)
         let last = app.staticTexts["Row 30"]
         var swipes = 0
-        while !last.isHittable && swipes < 8 {
+        while !last.exists && swipes < 8 {
             app.swipeUp()
             swipes += 1
         }
@@ -47,7 +47,6 @@ final class TallyUITests: XCTestCase {
         XCTAssertEqual(app.staticTexts["mode"].label, "Mode: UI testing")
         XCTAssertEqual(app.staticTexts["count"].label, "Count: 5")
     }
-
 
     /// A system alert that appears every time: iOS asks before calling a tel: link.
     @MainActor func testCallConfirmationAlert() throws {
@@ -80,5 +79,40 @@ final class OtherAppUITests: XCTestCase {
         let app = XCUIApplication()
         app.activate()
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+    }
+}
+
+/// The device itself: home button, screenshots, rotation.
+final class DeviceUITests: XCTestCase {
+    @MainActor func testHomeButtonAndBack() throws {
+        let app = XCUIApplication()
+        app.launch()
+        XCUIDevice.shared.press(.home)
+        XCTAssertTrue(app.wait(for: .runningBackground, timeout: 5))
+        app.activate()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+        XCTAssertTrue(app.buttons["Add"].waitForExistence(timeout: 5))
+    }
+
+    @MainActor func testScreenshot() throws {
+        let app = XCUIApplication()
+        app.launch()
+        let shot = app.screenshot()
+        print("screenshot: \(shot.image.size) at scale \(shot.image.scale), \(shot.pngRepresentation.count) bytes")
+        XCTAssertGreaterThan(shot.pngRepresentation.count, 10_000)
+        let attachment = XCTAttachment(screenshot: shot)
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    @MainActor func testRotation() throws {
+        let app = XCUIApplication()
+        app.launch()
+        XCUIDevice.shared.orientation = .landscapeLeft
+        defer { XCUIDevice.shared.orientation = .portrait }
+        let window = app.windows.firstMatch
+        let rotated = expectation(for: NSPredicate { _, _ in window.frame.width > window.frame.height }, evaluatedWith: nil)
+        wait(for: [rotated], timeout: 5)
+        XCTAssertTrue(app.buttons["Add"].isHittable)
     }
 }

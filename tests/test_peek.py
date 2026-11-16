@@ -384,7 +384,8 @@ class TestRunner(unittest.TestCase):
         self.assertIn("-> Bool { true }", peek.XCTEST_NONE)
 
     def test_runner_runs_only_its_own_module(self):
-        self.assertIn('arguments.filter = ["^\\(module)\\\\."]', peek.TEST_RUNNER_SOURCE)
+        self.assertIn('arguments.filter = ["^\\(module)\\\\." + (__peekTestFilter.isEmpty', peek.TEST_RUNNER_SOURCE)
+        self.assertIn("%FILTER%", peek.TEST_RUNNER_SOURCE)
 
 
 class ReviewFixes(unittest.TestCase):

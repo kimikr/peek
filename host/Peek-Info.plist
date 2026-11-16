@@ -84,6 +84,18 @@
     <array>
         <string>_peek._tcp</string>
     </array>
+    <!-- UI tests that open another app keep Peek running with silent audio meanwhile -->
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>audio</string>
+    </array>
+    <!-- xtool defaults iPhone to portrait only; previews and UI tests (XCUIDevice.orientation) rotate -->
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
     <key>NSLocalNetworkUsageDescription</key>
     <string>Peek connects to the peek dev server on your computer to load previews.</string>
     <key>ITSAppUsesNonExemptEncryption</key>

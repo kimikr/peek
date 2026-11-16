@@ -209,7 +209,8 @@ and XCTest tests inside the Peek app on the iPhone, with the real UIKit and Swif
 again every time you save. So tests that render views (`ImageRenderer`), use
 UIKit or need the device run from Linux, where `swift test` cannot run them.
 Results appear in the terminal as `swift test` prints them (failures in red,
-with file and line); the phone shows whether everything passed.
+with file and line); the phone shows whether everything passed and which tests
+failed. `--filter REGEX` runs only the tests whose `Suite/test` name matches.
 
 The test targets that depend on the previewed target are compiled into the
 same module as the code they test (`@testable import` is not needed but does
@@ -219,7 +220,56 @@ SDK; peek signs them and sends them to the phone once (about 22 MB with XCTest).
 
 XCTest normally talks to `testmanagerd`, a service that only runs once Xcode
 has prepared the phone for development; unit tests do not need it, so peek
-runs them without it. UI tests (`XCUIApplication`) do need it and cannot run.
+runs them without it.
+
+#### UI tests (XCUITest)
+
+Plain XCUITests run too, unchanged:
+
+```swift
+final class TallyUITests: XCTestCase {
+    @MainActor func testAdd() throws {
+        let app = XCUIApplication()
+        app.launchEnvironment = ["START_COUNT": "5"]
+        app.launch()
+        app.buttons["Add"].tap()
+        XCTAssertEqual(app.staticTexts["count"].label, "Count: 6")
+    }
+}
+```
+
+While they run, the phone shows the app being tested (its first `#Preview`,
+or the `@main` App) and the tests drive it: taps, typing, swipes, long
+presses, toggles and sliders, system alerts (through
+`XCUIApplication(bundleIdentifier: "com.apple.springboard")`), and other apps
+such as Settings. `XCUIApplication()` is the app in Peek; `launch()` starts it
+afresh with its `launchArguments` (also as `UserDefaults`) and
+`launchEnvironment`. See `examples/Calculator/Tests/CalcTests/TallyUITests.swift`.
+
+UI tests need what Xcode would set up:
+
+1. **Developer Mode** on (Settings → Privacy & Security), which sideloading
+   with a development certificate usually offers already.
+2. **The developer disk image**, which brings `testmanagerd`. Mount it with
+   [StikDebug](https://github.com/StephenDev0/StikDebug) (pair it once in its
+   settings, then open it with LocalDevVPN connected); it stays mounted until
+   the phone restarts.
+3. **Your passcode** once per Peek launch: UI tests switch the phone to
+   Automation Mode, and iOS asks before doing so.
+
+How peek gets there without Xcode: it points XCTest at the iOS 27 name of the
+daemon's service (`com.apple.dt.testmanagerd.runner`), gives it the
+configuration Xcode would hand a UI test runner, asks for Automation Mode,
+starts the app's accessibility server (apps only do that when launched under
+automation), and replaces the waits on an in-app agent that only Xcode
+injects with short pauses. While another app is in front, Peek keeps running
+with a background task and, if the app hosting it allows background audio
+(LiveContainer does), silent audio.
+
+Limits: `launch()` does not start a new process, so globals and singletons
+keep their state; `resetAuthorizationStatus(for:)` would terminate Peek, and
+permission alerts only appear while the app hosting Peek has not answered
+them yet.
 
 ### Finding the server
 
