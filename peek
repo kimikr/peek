@@ -1078,7 +1078,7 @@ final class __PeekFailureObserver: NSObject, XCTestObservation {
             let started = Date()
             let ok = original(event, selector, error)
             let duration = (event.value(forKey: "maximumOffset") as? Double) ?? 0
-            let end = started.addingTimeInterval(duration + 0.15)
+            let end = started.addingTimeInterval(duration + 0.3)  // and the screen update after the last one
             while Date() < end { RunLoop.current.run(until: min(end, Date().addingTimeInterval(0.05))) }
             return ok
         }

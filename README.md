@@ -265,8 +265,8 @@ UI tests need what Xcode would set up:
    [StikDebug](https://github.com/StephenDev0/StikDebug) (pair it once in its
    settings, then open it with LocalDevVPN connected); it stays mounted until
    the phone restarts.
-3. **Your passcode** once per Peek launch: UI tests switch the phone to
-   Automation Mode, and iOS asks before doing so.
+3. **Your passcode** for each run of the UI tests: they switch the phone to
+   Automation Mode, iOS asks before doing so, and the mode ends with the run.
 
 How peek gets there without Xcode: it points XCTest at the iOS 27 name of the
 daemon's service (`com.apple.dt.testmanagerd.runner`), gives it the
