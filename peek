@@ -790,12 +790,40 @@ extension SwiftUI.View {
 TEST_RUNNER_SOURCE = """
 import Testing
 
+let __peekRelaunchNotification = Notification.Name("peek.uitest.relaunch")
+
 struct __PeekTestRunner: SwiftUI.View {
+    /// The app under UI tests: shown full screen while they drive it. nil for unit tests only.
+    var app: SwiftUI.AnyView? = nil
     @SwiftUI.State private var result: CInt?
     @SwiftUI.State private var started = Date()
     @SwiftUI.State private var seconds = 0.0
+    @SwiftUI.State private var launches = 0
 
     var body: some SwiftUI.View {
+        SwiftUI.Group {
+            if let app {
+                app
+                    .id(launches)  // XCUIApplication.launch() starts the app afresh
+                    .overlay(alignment: .top) { status.allowsHitTesting(false).accessibilityHidden(true) }
+                    .onReceive(NotificationCenter.default.publisher(for: __peekRelaunchNotification)) { _ in launches += 1 }
+            } else {
+                summary
+            }
+        }
+        .task { await run() }
+    }
+
+    private var status: some SwiftUI.View {
+        SwiftUI.Text(result == nil ? "Running UI tests…" : result == 0 ? "All tests passed" : "Some tests failed")
+            .font(.caption.bold())
+            .padding(.horizontal, 10).padding(.vertical, 4)
+            .background(SwiftUI.Capsule().fill(result == nil ? SwiftUI.Color.gray : result == 0 ? SwiftUI.Color.green : SwiftUI.Color.red))
+            .foregroundStyle(SwiftUI.Color.white)
+            .padding(.top, 4)
+    }
+
+    private var summary: some SwiftUI.View {
         SwiftUI.VStack(spacing: 16) {
             if let result {
                 SwiftUI.Image(systemName: result == 0 ? "checkmark.circle.fill" : "xmark.octagon.fill")
@@ -809,10 +837,17 @@ struct __PeekTestRunner: SwiftUI.View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .task {
+    }
+
+    private func run() async {
             started = Date()
             let module = String(reflecting: __PeekTestRunner.self).split(separator: ".")[0]
-            let xctestPassed = __peekRunXCTests(module: String(module))
+            // Started from a run loop callback, not from this main-queue job: while XCTest waits
+            // it turns the run loop, and only outside a main-queue job does that let SwiftUI (on
+            // the main queue) update the app being tested.
+            let xctestPassed: Bool = await withCheckedContinuation { done in
+                RunLoop.main.perform { done.resume(returning: MainActor.assumeIsolated { __peekRunXCTests(module: String(module)) }) }
+            }
             let code = await Task.detached { () -> CInt in
                 var arguments = __CommandLineArguments_v0()
                 arguments.filter = ["^\\(module)\\\\."]  // this build's tests, not those of earlier builds
@@ -822,7 +857,6 @@ struct __PeekTestRunner: SwiftUI.View {
             let swiftTesting = code == 69 ? 0 : code  // 69: no Swift Testing tests in this target
             result = xctestPassed ? swiftTesting : max(swiftTesting, 1)
             print(result == 0 ? "peek: all tests passed" : "peek: tests failed")
-        }
     }
 }
 %XCTEST%"""
@@ -836,6 +870,7 @@ import XCTest
 import ObjectiveC
 
 let __peekUsesUITesting = %UITESTS%
+let __peekTargetBundleIdentifier = %TARGETBUNDLE%
 
 /// Runs the XCTestCase subclasses defined in this build and prints XCTest's usual log. Only this
 /// library's classes are looked at: earlier builds stay loaded, and touching arbitrary classes of
@@ -885,7 +920,37 @@ let __peekUsesUITesting = %UITESTS%
     if let configClass = NSClassFromString("XCTestConfiguration") as? NSObject.Type {
         let config = configClass.init()
         config.setValue(true, forKey: "initializeForUITesting")
+        // XCUIApplication() is the app being previewed, which is this very process: iOS knows it
+        // by the bundle identifier of the app hosting Peek (LiveContainer's, say).
+        config.setValue(__peekTargetBundleIdentifier, forKey: "targetApplicationBundleID")
+        let executable = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent().path
+        config.setValue(executable, forKey: "targetApplicationPath")
         _ = (configClass as AnyObject).perform(NSSelectorFromString("setActiveTestConfiguration:"), with: config)
+    }
+    // launch() would terminate the app, i.e. Peek: start the preview afresh instead.
+    if let application = NSClassFromString("XCUIApplication") {
+        let relaunch: @convention(block) (AnyObject) -> Void = { _ in
+            NotificationCenter.default.post(name: __peekRelaunchNotification, object: nil)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        }
+        let nothing: @convention(block) (AnyObject) -> Void = { _ in }
+        for (name, block) in [("launch", relaunch as Any), ("terminate", nothing)] {
+            if let method = class_getInstanceMethod(application, NSSelectorFromString(name)) {
+                method_setImplementation(method, imp_implementationWithBlock(block))
+            }
+        }
+    }
+    // Before and after each event XCTest waits for the target app to go idle. The target is
+    // this process, whose main thread is busy running the test, so that wait only ends at its
+    // ~30 s timeout. Let the app's run loop turn for a moment instead.
+    let settle: @convention(block) (AnyObject) -> Void = { _ in RunLoop.current.run(until: Date().addingTimeInterval(0.3)) }
+    let settleWithFlag: @convention(block) (AnyObject, Bool) -> Void = { _, _ in RunLoop.current.run(until: Date().addingTimeInterval(0.3)) }
+    for (className, name, block) in [("XCUIApplication", "_waitForQuiescence", settle as Any),
+                                     ("XCUIApplication", "_waitForQuiescenceAsPreEvent:", settleWithFlag),
+                                     ("XCAXClient_iOS", "waitForQuiescenceOnAllForegroundApplicationsAsPreEvent:", settleWithFlag)] {
+        if let target = NSClassFromString(className), let method = class_getInstanceMethod(target, NSSelectorFromString(name)) {
+            method_setImplementation(method, imp_implementationWithBlock(block))
+        }
     }
     typealias IsEnabled = @convention(c) () -> Bool
     let handle = dlopen("/System/Library/PrivateFrameworks/AutomationMode.framework/AutomationMode", RTLD_NOW)
@@ -1795,6 +1860,14 @@ class Builder:
             self.package_error = "building the dependencies failed:\n" + output
         return ok
 
+    @staticmethod
+    def target_bundle_identifier():
+        """The bundle identifier iOS knows the app hosting Peek by (reported by the phone)."""
+        try:
+            return (STATE_DIR / "identifier").read_text().strip()
+        except OSError:
+            return ""
+
     def shipped_frameworks(self):
         """Dynamic frameworks (and libraries) the phone needs next to the builds."""
         found = self.package.dynamic_frameworks() if self.package else []
@@ -1934,7 +2007,7 @@ class Builder:
             copy = srcdir / f"{tag}_{path.name}"
             write_if_changed(copy, new)
             inputs.append((copy, shown))
-        if self.tests:
+        if self.tests and not self.uses_ui_tests:
             cases = [("__PeekTestRunner()", "Tests")]
         elif self.root_expr:
             cases = [(self.root_expr, self.root_expr)]
@@ -1949,6 +2022,8 @@ class Builder:
                         "No #Preview block, @main App or View struct found.\n"
                         "Add `#Preview { MyView() }` or pass --root \"MyView()\"."}
             cases = [(f"{pick}()", pick)]
+        if self.tests and self.uses_ui_tests:  # UI tests drive the app the previews would show
+            cases = [(f"__PeekTestRunner(app: AnyView({cases[0][0]}))", "UI tests")]
         body = "\n".join(
             f"        case {i}: return UIHostingController(rootView: AnyView(__PeekGenerationRoot(content: AnyView({expr}))))"
             for i, (expr, _) in enumerate(cases))
@@ -1957,6 +2032,7 @@ class Builder:
                          + colors_source(self.colors)
                          + ("" if own_symbols else asset_symbols_source(self.colors, self.images, bool(bundle_name)))
                          + (TEST_RUNNER_SOURCE.replace("%XCTEST%", XCTEST_RUNNER.replace("%UITESTS%", "true" if self.uses_ui_tests else "false")
+                                                    .replace("%TARGETBUNDLE%", json.dumps(self.target_bundle_identifier()))
                                                     if self.uses_xctest else XCTEST_NONE)
                             if self.tests else ""))
         write_if_changed(entry, ENTRY_TEMPLATE.replace("%CASES%", body))

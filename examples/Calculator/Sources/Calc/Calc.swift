@@ -16,4 +16,5 @@ struct BadgeView: View {
     }
 }
 
-#Preview { BadgeView(count: 7) }
+#Preview("Tally") { TallyView() }
+#Preview("Badge") { BadgeView(count: 7) }
