@@ -43,7 +43,7 @@ struct TallyView: View {
                         .frame(height: 120)
                         .accessibilityElement(children: .contain)
                         .accessibilityIdentifier("pad")
-                        .simultaneousGesture(MagnifyGesture().onChanged { zoom = max(zoom, $0.magnification) })  // furthest it went
+                        .simultaneousGesture(MagnifyGesture().onChanged { zoom = max(zoom, $0.magnification); print("magnify \($0.magnification)") }.onEnded { print("magnify ended \($0.magnification)") })  // furthest it went
                         .simultaneousGesture(RotateGesture().onChanged { if abs($0.rotation.degrees) > abs(angle) { angle = $0.rotation.degrees } })
                     Text("Tap: \(side)").accessibilityIdentifier("side")
                     Text(String(format: "Zoom: %.1f, angle: %.0f", zoom, angle)).accessibilityIdentifier("zoom")

@@ -1043,9 +1043,10 @@ final class __PeekFailureObserver: NSObject, XCTestObservation {
     }
     // Before and after each event XCTest waits for the target app to go idle. The target is
     // this process, whose main thread is busy running the test, so that wait only ends at its
-    // ~30 s timeout. Let the app's run loop turn for a moment instead.
-    let settle: @convention(block) (AnyObject) -> Void = { _ in RunLoop.current.run(until: Date().addingTimeInterval(0.3)) }
-    let settleWithFlag: @convention(block) (AnyObject, Bool) -> Void = { _, _ in RunLoop.current.run(until: Date().addingTimeInterval(0.3)) }
+    // ~30 s timeout. Let the app's run loop turn for a moment, and until scrolling has stopped
+    // (a tap on a list still coasting after a swipe would only stop it).
+    let settle: @convention(block) (AnyObject) -> Void = { _ in __peekSettle(0.3) }
+    let settleWithFlag: @convention(block) (AnyObject, Bool) -> Void = { _, _ in __peekSettle(0.3) }
     // Activating or launching an app waits the same way (60 s for an idle notification only an
     // injected agent sends). Give the app a second to draw instead.
     let settleApp: @convention(block) (AnyObject, Bool, Bool) -> Void = { _, _, _ in RunLoop.current.run(until: Date().addingTimeInterval(1)) }
@@ -1117,6 +1118,21 @@ nonisolated(unsafe) var __peekTerminated = false
 func __peekIsTarget(_ app: AnyObject) -> Bool {
     guard !__peekTargetBundle.isEmpty, app.responds(to: NSSelectorFromString("bundleID")) else { return true }
     return (app.value(forKey: "bundleID") as? String).map { $0 == __peekTargetBundle } ?? true
+}
+
+/// Lets the run loop turn for `minimum` seconds and then while a scroll view is still moving (3 s at most).
+@MainActor func __peekSettle(_ minimum: Double) {
+    RunLoop.current.run(until: Date().addingTimeInterval(minimum))
+    func moving(_ view: UIView) -> Bool {
+        if let scroll = view as? UIScrollView, scroll.isDragging || scroll.isDecelerating { return true }
+        return view.subviews.contains(where: moving)
+    }
+    let deadline = Date().addingTimeInterval(3)
+    while Date() < deadline, UIApplication.shared.connectedScenes.contains(where: {
+        ($0 as? UIWindowScene)?.windows.contains(where: moving) ?? false
+    }) {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+    }
 }
 
 /// The original XCUIApplication.activate().
