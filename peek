@@ -791,6 +791,7 @@ TEST_RUNNER_SOURCE = """
 import Testing
 
 let __peekRelaunchNotification = Notification.Name("peek.uitest.relaunch")
+let __peekTerminateNotification = Notification.Name("peek.uitest.terminate")
 let __peekNoticeNotification = Notification.Name("peek.test.notice")
 /// Only tests whose "Suite/test" name matches this (with `peek test --filter`).
 let __peekTestFilter: String = %FILTER%
@@ -810,16 +811,22 @@ struct __PeekTestRunner: SwiftUI.View {
     @SwiftUI.State private var started = Date()
     @SwiftUI.State private var seconds = 0.0
     @SwiftUI.State private var launches = 0
+    @SwiftUI.State private var terminated = false
     @SwiftUI.State private var notice: String?
     @SwiftUI.State private var failed: [String] = []
 
     var body: some SwiftUI.View {
         SwiftUI.Group {
             if let app {
-                app
-                    .id(launches)  // XCUIApplication.launch() starts the app afresh
+                SwiftUI.Group {
+                    if terminated { SwiftUI.Color.black.ignoresSafeArea() } else { app.id(launches) }  // launch() starts it afresh
+                }
                     .overlay(alignment: .top) { status.allowsHitTesting(false).accessibilityHidden(true) }
-                    .onReceive(NotificationCenter.default.publisher(for: __peekRelaunchNotification)) { _ in launches += 1 }
+                    .onReceive(NotificationCenter.default.publisher(for: __peekRelaunchNotification)) { _ in
+                        terminated = false
+                        launches += 1
+                    }
+                    .onReceive(NotificationCenter.default.publisher(for: __peekTerminateNotification)) { _ in terminated = true }
             } else {
                 summary
             }
@@ -992,23 +999,38 @@ final class __PeekFailureObserver: NSObject, XCTestObservation {
         // Info.plist sits next to the executable.
         let executable = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
         let host = NSDictionary(contentsOf: executable.appendingPathComponent("Info.plist"))?["CFBundleIdentifier"] as? String
-        config.setValue(host ?? __peekTargetBundleIdentifier, forKey: "targetApplicationBundleID")
+        __peekTargetBundle = host ?? __peekTargetBundleIdentifier
+        config.setValue(__peekTargetBundle, forKey: "targetApplicationBundleID")
         config.setValue(executable.path, forKey: "targetApplicationPath")
         _ = (configClass as AnyObject).perform(NSSelectorFromString("setActiveTestConfiguration:"), with: config)
     }
-    // launch() would terminate the app, i.e. Peek: start the preview afresh instead.
+    // launch() would terminate the app, i.e. Peek: start the preview afresh instead, and let
+    // terminate() take it off screen. Other apps (Settings, say) launch and quit for real.
     if let application = NSClassFromString("XCUIApplication") {
-        let relaunch: @convention(block) (AnyObject) -> Void = { app in
-            __peekApplyLaunchOptions(app)
-            NotificationCenter.default.post(name: __peekRelaunchNotification, object: nil)
-            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+        func replace<Block>(_ name: String, _ make: (IMP) -> Block) {
+            guard let method = class_getInstanceMethod(application, NSSelectorFromString(name)) else { return }
+            method_setImplementation(method, imp_implementationWithBlock(make(method_getImplementation(method))))
         }
-        let nothing: @convention(block) (AnyObject) -> Void = { _ in }
-        for (name, block) in [("launch", relaunch as Any), ("terminate", nothing)] {
-            if let method = class_getInstanceMethod(application, NSSelectorFromString(name)) {
-                method_setImplementation(method, imp_implementationWithBlock(block))
-            }
-        }
+        typealias Call = @convention(c) (AnyObject, Selector) -> Void
+        typealias State = @convention(c) (AnyObject, Selector) -> UInt
+        replace("launch") { original -> @convention(block) (AnyObject) -> Void in { app in
+            guard __peekIsTarget(app) else { return unsafeBitCast(original, to: Call.self)(app, NSSelectorFromString("launch")) }
+            __peekRelaunch(app)
+        } }
+        replace("activate") { original -> @convention(block) (AnyObject) -> Void in { app in
+            if __peekIsTarget(app), __peekTerminated { return __peekRelaunch(app) }  // activate() launches a quit app
+            unsafeBitCast(original, to: Call.self)(app, NSSelectorFromString("activate"))
+        } }
+        replace("terminate") { original -> @convention(block) (AnyObject) -> Void in { app in
+            guard __peekIsTarget(app) else { return unsafeBitCast(original, to: Call.self)(app, NSSelectorFromString("terminate")) }
+            __peekTerminated = true
+            NotificationCenter.default.post(name: __peekTerminateNotification, object: nil)
+            RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        } }
+        replace("state") { original -> @convention(block) (AnyObject) -> UInt in { app in
+            if __peekIsTarget(app), __peekTerminated { return 1 }  // XCUIApplication.State.notRunning
+            return unsafeBitCast(original, to: State.self)(app, NSSelectorFromString("state"))
+        } }
     }
     // Before and after each event XCTest waits for the target app to go idle. The target is
     // this process, whose main thread is busy running the test, so that wait only ends at its
@@ -1079,6 +1101,21 @@ final class __PeekFailureObserver: NSObject, XCTestObservation {
 /// real launch would: environment variables, ProcessInfo.arguments, and `-key value` pairs in
 /// UserDefaults' argument domain.
 nonisolated(unsafe) var __peekLaunchArguments: [String] = []
+/// The bundle identifier iOS knows the app under test by, and whether terminate() took it down.
+nonisolated(unsafe) var __peekTargetBundle = ""
+nonisolated(unsafe) var __peekTerminated = false
+
+func __peekIsTarget(_ app: AnyObject) -> Bool {
+    guard !__peekTargetBundle.isEmpty, app.responds(to: NSSelectorFromString("bundleID")) else { return true }
+    return (app.value(forKey: "bundleID") as? String).map { $0 == __peekTargetBundle } ?? true
+}
+
+@MainActor func __peekRelaunch(_ app: AnyObject) {
+    __peekTerminated = false
+    __peekApplyLaunchOptions(app)
+    NotificationCenter.default.post(name: __peekRelaunchNotification, object: nil)
+    RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+}
 
 func __peekApplyLaunchOptions(_ app: AnyObject) {
     let environment = (app.value(forKey: "launchEnvironment") as? [String: String]) ?? [:]
@@ -1887,6 +1924,7 @@ class Builder:
         # Hot patching keeps view state across edits that only change function bodies.
         self.tests = getattr(args, "tests", False)  # run the test targets on the phone instead of previews
         self.test_filter = getattr(args, "filter", None)  # regular expression on "Suite/test" names
+        self.junit = getattr(args, "junit", None)  # file for the results as JUnit XML
         if self.tests:
             # Earlier builds stay loaded and Swift Testing finds tests in every loaded image, so
             # each build gets a module of its own and the runner only runs that module's tests.
@@ -2632,6 +2670,68 @@ COPY_NAME_RE = re.compile(r"\b[0-9a-f]{8}_[\w.+-]+\.swift\b")  # peek's copies o
 DUPLICATE_CLASS_RE = re.compile(r"objc\[\d+\]: Class \S+ is implemented in both ")
 
 
+class TestReport:
+    """Results of one `peek test` run, read from the console output the phone forwards."""
+
+    XCTEST_CASE = re.compile(r"Test Case '-\[(?:\w+\.)?(\w+) (\w+)\]' (passed|failed|skipped) \((\d+(?:\.\d+)?) seconds\)")
+    XCTEST_ISSUE = re.compile(r"^(.*?): error: -\[(?:\w+\.)?(\w+) (\w+)\] : (.*)$")
+    SWIFT_TESTING_DONE = re.compile(r"^\s*[✔✘↷] Test (.+?) (passed|failed|skipped)(?: after (\d+(?:\.\d+)?) seconds)?")
+    SWIFT_TESTING_ISSUE = re.compile(r"^\s*✘ Test (.+?) recorded an issue(?: at (\S+))?: (.*)$")
+    DONE = {"peek: all tests passed": 0, "peek: tests failed": 1}
+
+    def __init__(self):
+        self.cases = []  # (suite, name, outcome, seconds, [messages])
+        self.issues = {}  # (suite, name) -> messages seen before the case finished
+
+    def feed(self, line):
+        """Takes one output line; returns 0 or 1 once the run has finished, else None."""
+        line = line.strip()
+        if line in self.DONE:
+            return self.DONE[line]
+        m = self.XCTEST_ISSUE.match(line)
+        if m:
+            self.issues.setdefault((m.group(2), m.group(3)), []).append(f"{m.group(1)}: {m.group(4)}")
+            return None
+        m = self.SWIFT_TESTING_ISSUE.match(line)
+        if m:
+            self.issues.setdefault(("Swift Testing", m.group(1)), []).append(f"{m.group(2) or ''}: {m.group(3)}".lstrip(": "))
+            return None
+        m = self.XCTEST_CASE.search(line)
+        if m:
+            self._finish(m.group(1), m.group(2), m.group(3), float(m.group(4)))
+            return None
+        m = self.SWIFT_TESTING_DONE.match(line)
+        if m and not m.group(1).startswith("run with "):
+            self._finish("Swift Testing", m.group(1), m.group(2), float(m.group(3) or 0))
+        return None
+
+    def _finish(self, suite, name, outcome, seconds):
+        self.cases.append((suite, name, outcome, seconds, self.issues.pop((suite, name), [])))
+
+    def junit(self):
+        """The run as JUnit XML, which CI services show as test results."""
+        import xml.etree.ElementTree as ET
+        root = ET.Element("testsuites", name="peek test")
+        suites = {}
+        for suite, name, outcome, seconds, messages in self.cases:
+            if suite not in suites:
+                suites[suite] = ET.SubElement(root, "testsuite", name=suite)
+            case = ET.SubElement(suites[suite], "testcase", classname=suite, name=name, time=f"{seconds:.3f}")
+            if outcome == "failed":
+                ET.SubElement(case, "failure", message=(messages or ["failed"])[0]).text = "\n".join(messages)
+            elif outcome == "skipped":
+                ET.SubElement(case, "skipped")
+        for element in [root, *suites.values()]:
+            cases = element.iter("testcase")
+            listed = list(cases)
+            element.set("tests", str(len(listed)))
+            element.set("failures", str(sum(1 for c in listed if c.find("failure") is not None)))
+            element.set("skipped", str(sum(1 for c in listed if c.find("skipped") is not None)))
+            element.set("time", f"{sum(float(c.get('time')) for c in listed):.3f}")
+        ET.indent(root)
+        return ET.tostring(root, encoding="unicode", xml_declaration=True) + "\n"
+
+
 def derive(token, label):
     return hmac.new(bytes.fromhex(token), label.encode(), hashlib.sha256).digest()
 
@@ -2985,6 +3085,24 @@ class Hub:
         self.devices_saved = 0
         self.shot = 0  # screenshot requests so far; the phone answers each one
         self.shots = {}  # request number -> PNG bytes
+        self.report = TestReport()  # results of the test run in progress (`peek test`)
+        self.finished = None  # exit code of the first finished test run, for `peek test --once`
+
+    def test_output(self, line):
+        """Collects test results; at the end of a run writes --junit and ends a --once run."""
+        code = self.report.feed(line)
+        if code is None:
+            return
+        report, self.report = self.report, TestReport()
+        junit = self.builder.junit
+        if junit:
+            try:
+                Path(junit).write_text(report.junit())
+                log(f"wrote {junit} ({len(report.cases)} tests)", "dim")
+            except OSError as e:
+                log(f"cannot write {junit}: {e}", "red")
+        if self.finished is None:
+            self.finished = code
 
     def snapshot(self):
         cert = self.signer.info or {}
@@ -3331,6 +3449,8 @@ def make_handler(hub):
                             failed = line.lstrip().startswith("✘") or " error: " in line or "' failed (" in line  # Swift Testing, XCTest
                             color = "red" if level == "crash" or failed else "dim"
                             log(f"│ {printable(line)}", color)
+                            if hub.builder.tests:
+                                hub.test_output(line)
                     elif entry.get("message"):
                         log(f"[phone] {printable(entry['message'])}", {"error": "red", "warn": "yellow"}.get(level, "dim"))
                     if isinstance(entry.get("diagnostics"), dict):
@@ -3460,6 +3580,7 @@ def cmd_dev(args):
 
     seen = seen_package = None
     cert_stamp = hub.signer.stamp()
+    once, exit_code = getattr(args, "once", False), None
     try:
         while True:
             if hub.signer.stamp() != cert_stamp:  # installed from the phone or with `peek cert`
@@ -3481,6 +3602,13 @@ def cmd_dev(args):
                 # Read again: the dependency build may create files (Package.resolved, bundles).
                 seen_package, seen = builder.package_fingerprint(), builder.fingerprint()
                 hub.rebuild()
+                if once and hub.state.get("status") == "error":
+                    exit_code = 1  # nothing to run
+                    break
+            if once and hub.finished is not None:
+                time.sleep(0.5)  # the phone's last lines and its next request
+                exit_code = hub.finished
+                break
             time.sleep(0.2)
     except KeyboardInterrupt:
         print()
@@ -3492,6 +3620,8 @@ def cmd_dev(args):
                 (STATE_DIR / "server.json").unlink()
         except (OSError, ValueError):
             pass
+    if exit_code is not None:
+        sys.exit(exit_code)
 
 
 def cmd_doctor(args):
@@ -3704,6 +3834,9 @@ def main():
     test.add_argument("--host", action="append", help="address to advertise in the pairing link (repeatable)")
     test.add_argument("--no-discovery", action="store_true", help="do not advertise the server with Bonjour")
     test.add_argument("--filter", help='run only tests whose "Suite/test" name matches this regular expression')
+    test.add_argument("--once", action="store_true",
+                      help="run the tests once and exit with their result (0: passed), e.g. for CI or a git hook")
+    test.add_argument("--junit", metavar="FILE", help="write each run's results to FILE as JUnit XML")
     test.set_defaults(func=cmd_dev, tests=True)
 
     build = sub.add_parser("build", help="compile once and report errors (no server)")

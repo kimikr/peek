@@ -6,6 +6,9 @@ struct TallyView: View {
     @State private var name = ""
     @State private var notify = false
     @State private var level = 0.5
+    @State private var side = "none"
+    @State private var zoom = 1.0
+    @State private var angle = 0.0
 
     var body: some View {
         NavigationStack {
@@ -14,6 +17,21 @@ struct TallyView: View {
                     Text("Count: \(count)").accessibilityIdentifier("count")
                     Button("Add") { count += 1 }
                     Button("Reset", role: .destructive) { count = 0 }
+                }
+                Section {
+                    // Coordinate taps, pinch and two-finger rotation (TallyUITests.testPad*).
+                    GeometryReader { geo in
+                        RoundedRectangle(cornerRadius: 12).fill(.tint.opacity(0.3))
+                            .contentShape(Rectangle())
+                            .gesture(SpatialTapGesture().onEnded { side = $0.location.x < geo.size.width / 2 ? "left" : "right" })
+                    }
+                        .frame(height: 120)
+                        .accessibilityElement(children: .contain)
+                        .accessibilityIdentifier("pad")
+                        .simultaneousGesture(MagnifyGesture().onEnded { zoom = $0.magnification })
+                        .simultaneousGesture(RotateGesture().onEnded { angle = $0.rotation.degrees })
+                    Text("Tap: \(side)").accessibilityIdentifier("side")
+                    Text(String(format: "Zoom: %.1f, angle: %.0f", zoom, angle)).accessibilityIdentifier("zoom")
                 }
                 Section {
                     TextField("Your name", text: $name).accessibilityIdentifier("name")

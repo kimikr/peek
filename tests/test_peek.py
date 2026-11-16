@@ -694,5 +694,59 @@ class Server(unittest.TestCase):
         self.assertEqual(json.loads(self.call("POST", "/v1/log", body=body)), {})
 
 
+class TestReportParsing(unittest.TestCase):
+    LINES = """Test Case '-[PeekBuild_bf289e_1.DeviceUITests testRotation]' started.
+Tests/CalcTests/TallyUITests.swift:117: error: -[PeekBuild_bf289e_1.DeviceUITests testRotation] : XCTAssertGreaterThan failed: ("393.0") is not greater than ("852.0")
+Test Case '-[PeekBuild_bf289e_1.DeviceUITests testRotation]' failed (3.479 seconds).
+Test Case '-[PeekBuild_bf289e_1.DeviceUITests testScreenshot]' passed (0.707 seconds).
+Test Case '-[PeekBuild_bf289e_1.LegacyCalculatorTests testAdd]' passed (0.054 seconds).
+✔ Test adds() passed after 0.001 seconds.
+✘ Test deliberatelyFails() recorded an issue at Tests/CalcTests/CalcTests.swift:25:9: Expectation failed: Calculator().add(2, 2) == 5
+✘ Test deliberatelyFails() failed after 0.008 seconds with 1 issue.
+✘ Suite ViewTests failed after 0.008 seconds with 1 issue.
+✘ Test run with 4 tests in 2 suites failed after 0.008 seconds with 1 issue.
+peek: tests failed""".splitlines()
+
+    def test_collects_cases_and_finishes(self):
+        report = peek.TestReport()
+        codes = [report.feed(line) for line in self.LINES]
+        self.assertEqual(codes[-1], 1)
+        self.assertTrue(all(c is None for c in codes[:-1]))
+        self.assertEqual([(c[0], c[1], c[2]) for c in report.cases], [
+            ("DeviceUITests", "testRotation", "failed"), ("DeviceUITests", "testScreenshot", "passed"),
+            ("LegacyCalculatorTests", "testAdd", "passed"), ("Swift Testing", "adds()", "passed"),
+            ("Swift Testing", "deliberatelyFails()", "failed")])
+        self.assertIn("TallyUITests.swift:117", report.cases[0][4][0])
+        self.assertIn("CalcTests.swift:25:9: Expectation failed", report.cases[4][4][0])
+
+    def test_junit(self):
+        report = peek.TestReport()
+        for line in self.LINES:
+            report.feed(line)
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(report.junit())
+        self.assertEqual((root.get("tests"), root.get("failures")), ("5", "2"))
+        device = root.find("testsuite[@name='DeviceUITests']")
+        self.assertEqual(device.get("tests"), "2")
+        self.assertIn("852.0", device.find("testcase[@name='testRotation']/failure").get("message"))
+
+    def test_passing_run(self):
+        self.assertEqual(peek.TestReport().feed("peek: all tests passed"), 0)
+
+    def test_hub_writes_junit_and_keeps_first_result(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            junit = Path(tmp) / "results.xml"
+            hub = peek.Hub(SimpleNamespace(junit=str(junit), tests=True), None, b"k")
+            for line in self.LINES:
+                hub.test_output(line)
+            self.assertEqual(hub.finished, 1)
+            self.assertIn('failures="2"', junit.read_text())
+            for line in ["Test Case '-[M.A testB]' passed (0.1 seconds).", "peek: all tests passed"]:
+                hub.test_output(line)
+            self.assertEqual(hub.finished, 1)  # --once ends with the first run
+            self.assertIn('tests="1"', junit.read_text())  # each run rewrites the file
+
+
 if __name__ == "__main__":
     unittest.main()

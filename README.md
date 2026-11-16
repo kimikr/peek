@@ -212,6 +212,15 @@ Results appear in the terminal as `swift test` prints them (failures in red,
 with file and line); the phone shows whether everything passed and which tests
 failed. `--filter REGEX` runs only the tests whose `Suite/test` name matches.
 
+For a script, a git hook or CI with a phone attached, `--once` runs the tests
+once and exits with their result (0 when everything passed, 1 when a test or
+the build failed), and `--junit FILE` writes each run's results as JUnit XML,
+which CI services show as test results:
+
+```sh
+peek test --once --junit results.xml
+```
+
 The test targets that depend on the previewed target are compiled into the
 same module as the code they test (`@testable import` is not needed but does
 no harm), along with their dependencies. Outside a package, tests come from
@@ -240,11 +249,13 @@ final class TallyUITests: XCTestCase {
 
 While they run, the phone shows the app being tested (its first `#Preview`,
 or the `@main` App) and the tests drive it: taps, typing, swipes, long
-presses, toggles and sliders, system alerts (through
+presses, toggles and sliders, the home button, rotation
+(`XCUIDevice.shared.orientation`), screenshots, system alerts (through
 `XCUIApplication(bundleIdentifier: "com.apple.springboard")`), and other apps
 such as Settings. `XCUIApplication()` is the app in Peek; `launch()` starts it
 afresh with its `launchArguments` (also as `UserDefaults`) and
-`launchEnvironment`. See `examples/Calculator/Tests/CalcTests/TallyUITests.swift`.
+`launchEnvironment`, and `terminate()` takes it off screen (its state is then
+`.notRunning`) until `launch()` or `activate()`. See `examples/Calculator/Tests/CalcTests/TallyUITests.swift`.
 
 UI tests need what Xcode would set up:
 
@@ -266,10 +277,16 @@ injects with short pauses. While another app is in front, Peek keeps running
 with a background task and, if the app hosting it allows background audio
 (LiveContainer does), silent audio.
 
-Limits: `launch()` does not start a new process, so globals and singletons
-keep their state; `resetAuthorizationStatus(for:)` would terminate Peek, and
-permission alerts only appear while the app hosting Peek has not answered
-them yet.
+Limits:
+
+- The app runs in Peek's process, so `launch()` and `terminate()` do not start
+  or end a process: globals, singletons and files keep their state between
+  launches (reset them through `launchArguments` if a test needs a clean
+  start), and launch-time metrics (`XCTApplicationLaunchMetric`) mean nothing.
+- `resetAuthorizationStatus(for:)` would terminate Peek, and permission alerts
+  only appear while the app hosting Peek has not answered them yet.
+- There is no `.xcresult` bundle; use `--junit` for machine-readable results.
+- It needs a phone: there is no iOS simulator outside macOS.
 
 ### Finding the server
 

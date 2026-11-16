@@ -48,6 +48,43 @@ final class TallyUITests: XCTestCase {
         XCTAssertEqual(app.staticTexts["count"].label, "Count: 5")
     }
 
+    @MainActor func testPadCoordinateTaps() throws {
+        let app = XCUIApplication()
+        app.launch()
+        let pad = app.otherElements["pad"]
+        pad.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.5)).tap()
+        XCTAssertEqual(app.staticTexts["side"].label, "Tap: right")
+        pad.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.5)).tap()
+        XCTAssertEqual(app.staticTexts["side"].label, "Tap: left")
+    }
+
+    @MainActor func testPadPinchAndRotate() throws {
+        let app = XCUIApplication()
+        app.launch()
+        let pad = app.otherElements["pad"]
+        pad.pinch(withScale: 2, velocity: 1)
+        pad.rotate(.pi / 2, withVelocity: 1)
+        let label = app.staticTexts["zoom"].label  // "Zoom: 2.0, angle: 90"
+        print("pad after pinch and rotate: \(label)")
+        let numbers = label.split(whereSeparator: { !"0123456789.-".contains($0) }).compactMap { Double($0) }
+        XCTAssertEqual(numbers.count, 2, label)
+        XCTAssertGreaterThan(numbers.first ?? 0, 1.3, label)
+        XCTAssertGreaterThan(abs(numbers.last ?? 0), 30, label)
+    }
+
+    /// terminate() takes the app off screen (Peek itself keeps running); launch() brings it back.
+    @MainActor func testTerminateAndLaunch() throws {
+        let app = XCUIApplication()
+        app.launch()
+        app.buttons["Add"].tap()
+        app.terminate()
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 5))
+        XCTAssertFalse(app.buttons["Add"].exists)
+        app.launch()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 5))
+        XCTAssertEqual(app.staticTexts["count"].label, "Count: 0")
+    }
+
     /// A system alert that appears every time: iOS asks before calling a tel: link.
     @MainActor func testCallConfirmationAlert() throws {
         let app = XCUIApplication()
@@ -79,6 +116,19 @@ final class OtherAppUITests: XCTestCase {
         let app = XCUIApplication()
         app.activate()
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+    }
+
+    /// launch() and terminate() of another app start and end that app for real.
+    @MainActor func testSettingsLaunchAndTerminate() throws {
+        let settings = XCUIApplication(bundleIdentifier: "com.apple.Preferences")
+        settings.launch()
+        XCTAssertTrue(settings.wait(for: .runningForeground, timeout: 10))
+        settings.terminate()
+        XCTAssertTrue(settings.wait(for: .notRunning, timeout: 10))
+        let app = XCUIApplication()
+        app.activate()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+        XCTAssertTrue(app.buttons["Add"].waitForExistence(timeout: 5))
     }
 }
 

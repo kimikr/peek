@@ -8,6 +8,10 @@ final class LegacyCalculatorTests: XCTestCase {
         XCTAssertEqual(Calculator().add(40, 2), 42)
     }
 
+    func testAddPerformance() {
+        measure { _ = (1...100_000).reduce(0) { Calculator().add($0, $1) } }
+    }
+
     func testDivideByZero() {
         XCTAssertNil(Calculator().divide(1, 0))
     }
