@@ -38,4 +38,29 @@ final class TallyUITests: XCTestCase {
         }
         XCTAssertTrue(last.isHittable, "Row 30 not reached after \(swipes) swipes")
     }
+
+    @MainActor func testLaunchArgumentsAndEnvironment() throws {
+        let app = XCUIApplication()
+        app.launchArguments = ["-uiTesting"]
+        app.launchEnvironment = ["START_COUNT": "5"]
+        app.launch()
+        XCTAssertEqual(app.staticTexts["mode"].label, "Mode: UI testing")
+        XCTAssertEqual(app.staticTexts["count"].label, "Count: 5")
+    }
+
+
+    /// A system alert that appears every time: iOS asks before calling a tel: link.
+    @MainActor func testCallConfirmationAlert() throws {
+        let app = XCUIApplication()
+        app.launch()
+        app.buttons["Call support"].tap()
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let alert = springboard.alerts.firstMatch
+        XCTAssertTrue(alert.waitForExistence(timeout: 5), "no call confirmation")
+        print("alert: \(alert.label) buttons: \(alert.buttons.allElementsBoundByIndex.map(\.label))")
+        let cancel = alert.buttons.matching(NSPredicate(format: "label == 'Cancel' OR label == '취소'")).firstMatch
+        XCTAssertTrue(cancel.exists)
+        cancel.tap()
+        XCTAssertTrue(app.buttons["Call support"].waitForExistence(timeout: 3))
+    }
 }

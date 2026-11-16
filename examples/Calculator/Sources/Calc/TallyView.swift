@@ -2,7 +2,7 @@ import SwiftUI
 
 /// A small screen for the UI tests in Tests/CalcTests/TallyUITests.swift.
 struct TallyView: View {
-    @State private var count = 0
+    @State private var count = Int(ProcessInfo.processInfo.environment["START_COUNT"] ?? "") ?? 0
     @State private var name = ""
     @State private var notify = false
     @State private var level = 0.5
@@ -23,6 +23,11 @@ struct TallyView: View {
                     Toggle("Notifications", isOn: $notify).accessibilityIdentifier("notify")
                     Slider(value: $level).accessibilityIdentifier("level")
                     Text("Level \(Int(level * 100))").accessibilityIdentifier("levelText")
+                }
+                Section {
+                    Text(ProcessInfo.processInfo.arguments.contains("-uiTesting") ? "Mode: UI testing" : "Mode: normal")
+                        .accessibilityIdentifier("mode")
+                    Button("Call support") { UIApplication.shared.open(URL(string: "tel:0123456789")!) }
                 }
                 Section { BadgeView(count: count) }
                 Section("Rows") {

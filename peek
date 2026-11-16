@@ -936,7 +936,8 @@ let __peekTargetBundleIdentifier = %TARGETBUNDLE%
     }
     // launch() would terminate the app, i.e. Peek: start the preview afresh instead.
     if let application = NSClassFromString("XCUIApplication") {
-        let relaunch: @convention(block) (AnyObject) -> Void = { _ in
+        let relaunch: @convention(block) (AnyObject) -> Void = { app in
+            __peekApplyLaunchOptions(app)
             NotificationCenter.default.post(name: __peekRelaunchNotification, object: nil)
             RunLoop.current.run(until: Date().addingTimeInterval(0.5))
         }
@@ -967,6 +968,23 @@ let __peekTargetBundleIdentifier = %TARGETBUNDLE%
         let interval: @convention(block) (AnyObject) -> Double = { _ in 0.2 }
         method_setImplementation(method, imp_implementationWithBlock(interval))
     }
+    // With that short delay the call returns while a long event (typing a word, a swipe) is
+    // still playing: let the app's run loop turn until the whole event has been delivered.
+    if let record = NSClassFromString("XCSynthesizedEventRecord"),
+       let method = class_getInstanceMethod(record, NSSelectorFromString("synthesizeWithError:")) {
+        typealias Synthesize = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<NSError?>?) -> Bool
+        let original = unsafeBitCast(method_getImplementation(method), to: Synthesize.self)
+        let selector = NSSelectorFromString("synthesizeWithError:")
+        let replacement: @convention(block) (AnyObject, UnsafeMutablePointer<NSError?>?) -> Bool = { event, error in
+            let started = Date()
+            let ok = original(event, selector, error)
+            let duration = (event.value(forKey: "maximumOffset") as? Double) ?? 0
+            let end = started.addingTimeInterval(duration + 0.15)
+            while Date() < end { RunLoop.current.run(until: min(end, Date().addingTimeInterval(0.05))) }
+            return ok
+        }
+        method_setImplementation(method, imp_implementationWithBlock(replacement))
+    }
     typealias IsEnabled = @convention(c) () -> Bool
     let handle = dlopen("/System/Library/PrivateFrameworks/AutomationMode.framework/AutomationMode", RTLD_NOW)
     let isEnabled = dlsym(handle, "XAMIsAutomationModeEnabled").map { unsafeBitCast($0, to: IsEnabled.self) }
@@ -985,6 +1003,43 @@ let __peekTargetBundleIdentifier = %TARGETBUNDLE%
         RunLoop.current.run(until: Date().addingTimeInterval(0.25))
     }
     print("peek: Automation Mode is \(isEnabled?() == true ? "on" : "still off")")
+}
+
+/// launchArguments and launchEnvironment of XCUIApplication, applied to this process the way a
+/// real launch would: environment variables, ProcessInfo.arguments, and `-key value` pairs in
+/// UserDefaults' argument domain.
+nonisolated(unsafe) var __peekLaunchArguments: [String] = []
+
+func __peekApplyLaunchOptions(_ app: AnyObject) {
+    let environment = (app.value(forKey: "launchEnvironment") as? [String: String]) ?? [:]
+    for (key, value) in environment { setenv(key, value, 1) }
+    let arguments = (app.value(forKey: "launchArguments") as? [String]) ?? []
+    if __peekLaunchArguments.isEmpty, !arguments.isEmpty,
+       // The concrete class: since iOS 17 ProcessInfo is a Swift subclass with its own getter.
+       let method = class_getInstanceMethod(object_getClass(ProcessInfo.processInfo), #selector(getter: ProcessInfo.arguments)) {
+        let original = ProcessInfo.processInfo.arguments
+        let combined: @convention(block) (AnyObject) -> NSArray = { _ in (original + __peekLaunchArguments) as NSArray }
+        method_setImplementation(method, imp_implementationWithBlock(combined))
+    }
+    __peekLaunchArguments = arguments
+    var defaults: [String: Any] = [:]
+    var index = 0
+    while index < arguments.count {
+        let argument = arguments[index]
+        if argument.hasPrefix("-"), argument.count > 1, index + 1 < arguments.count {
+            let value = arguments[index + 1]
+            if let data = value.data(using: .utf8),
+               let parsed = try? PropertyListSerialization.propertyList(from: data, format: nil) {
+                defaults[String(argument.dropFirst())] = parsed
+            } else {
+                defaults[String(argument.dropFirst())] = value
+            }
+            index += 2
+        } else {
+            index += 1
+        }
+    }
+    UserDefaults.standard.setVolatileDomain(defaults, forName: UserDefaults.argumentDomain)
 }
 
 /// XCUITest reads an app through its accessibility server, which apps start only when launched
