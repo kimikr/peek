@@ -939,6 +939,10 @@ let __peekTargetBundleIdentifier = %TARGETBUNDLE%
     if classes.isEmpty { return true }
     let suite = XCTestSuite(name: "All tests")
     let filter = __peekTestFilter.isEmpty ? nil : try? NSRegularExpression(pattern: __peekTestFilter)
+    if !__peekTestFilter.isEmpty, filter == nil {
+        print("peek: --filter is not a valid regular expression: \(__peekTestFilter)")
+        return false
+    }
     for testClass in classes.sorted(by: { NSStringFromClass($0) < NSStringFromClass($1) }) {
         let classSuite = XCTestSuite(forTestCaseClass: testClass)
         guard let filter else { suite.addTest(classSuite); continue }
@@ -1009,13 +1013,14 @@ final class __PeekFailureObserver: NSObject, XCTestObservation {
     // terminate() take it off screen. Other apps (Settings, say) launch and quit for real.
     if let application = NSClassFromString("XCUIApplication") {
         func replace<Block>(_ name: String, _ make: (IMP) -> Block) {
-            guard let method = class_getInstanceMethod(application, NSSelectorFromString(name)) else { return }
-            method_setImplementation(method, imp_implementationWithBlock(make(method_getImplementation(method))))
+            guard let original = __peekOriginal(application, name),
+                  let method = class_getInstanceMethod(application, NSSelectorFromString(name)) else { return }
+            method_setImplementation(method, imp_implementationWithBlock(make(original)))
         }
         typealias Call = @convention(c) (AnyObject, Selector) -> Void
         typealias State = @convention(c) (AnyObject, Selector) -> UInt
-        let activate = class_getInstanceMethod(application, NSSelectorFromString("activate")).map(method_getImplementation)
-        let stateOf = class_getInstanceMethod(application, NSSelectorFromString("state")).map(method_getImplementation)
+        let activate = __peekOriginal(application, "activate")
+        let stateOf = __peekOriginal(application, "state")
         __peekActivate = { app in
             // An app testmanagerd launches never loads its accessibility server; one opened the
             // usual way (as from the Home Screen) does. So a quit app is opened first.
@@ -1086,9 +1091,10 @@ final class __PeekFailureObserver: NSObject, XCTestObservation {
     // With that short delay the call returns while a long event (typing a word, a swipe) is
     // still playing: let the app's run loop turn until the whole event has been delivered.
     if let record = NSClassFromString("XCSynthesizedEventRecord"),
-       let method = class_getInstanceMethod(record, NSSelectorFromString("synthesizeWithError:")) {
+       let method = class_getInstanceMethod(record, NSSelectorFromString("synthesizeWithError:")),
+       let originalIMP = __peekOriginal(record, "synthesizeWithError:") {
         typealias Synthesize = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<NSError?>?) -> Bool
-        let original = unsafeBitCast(method_getImplementation(method), to: Synthesize.self)
+        let original = unsafeBitCast(originalIMP, to: Synthesize.self)
         let selector = NSSelectorFromString("synthesizeWithError:")
         let replacement: @convention(block) (AnyObject, UnsafeMutablePointer<NSError?>?) -> Bool = { event, error in
             let started = Date()
@@ -1150,6 +1156,18 @@ func __peekIsTarget(_ app: AnyObject) -> Bool {
     }
 }
 
+/// The implementation a method had before any peek build replaced it. Each build is a module of
+/// its own and replaces the same methods again (the process keeps them): taking the current
+/// implementation as "the original" would chain every earlier build's replacement, and its
+/// stale state, into this one. The first original is kept under a second selector.
+func __peekOriginal(_ cls: AnyClass, _ name: String) -> IMP? {
+    let saved = NSSelectorFromString("__peekOriginal_" + name)
+    if let kept = class_getInstanceMethod(cls, saved) { return method_getImplementation(kept) }
+    guard let method = class_getInstanceMethod(cls, NSSelectorFromString(name)) else { return nil }
+    class_addMethod(cls, saved, method_getImplementation(method), method_getTypeEncoding(method))
+    return method_getImplementation(method)
+}
+
 /// The original XCUIApplication.activate().
 nonisolated(unsafe) var __peekActivate: (AnyObject) -> Void = { _ in }
 
@@ -1170,23 +1188,35 @@ nonisolated(unsafe) var __peekActivate: (AnyObject) -> Void = { _ in }
     }
 }
 
-/// Variables the last launch() set, which a real launch would not pass on to the next one.
-nonisolated(unsafe) var __peekLaunchedEnvironment: [String: String?] = [:]  // name -> value before
+/// Hooks ProcessInfo.arguments for this build (once): the process's own arguments, then those of
+/// the last launch().
+nonisolated(unsafe) var __peekArgumentsHooked = false
 
 func __peekApplyLaunchOptions(_ app: AnyObject) {
-    for (key, before) in __peekLaunchedEnvironment {
-        if let before { setenv(key, before, 1) } else { unsetenv(key) }
+    // Variables the last launch() set (by any build, so kept in the environment itself) are
+    // put back first: a real launch would not pass them on to the next one.
+    let ledger = "PEEK_LAUNCHED_ENVIRONMENT"
+    if let saved = getenv(ledger).flatMap({ try? JSONSerialization.jsonObject(with: Data(String(cString: $0).utf8)) as? [String: Any] }) {
+        for (key, before) in saved {
+            if let before = before as? String { setenv(key, before, 1) } else { unsetenv(key) }
+        }
     }
     let environment = (app.value(forKey: "launchEnvironment") as? [String: String]) ?? [:]
-    __peekLaunchedEnvironment = Dictionary(uniqueKeysWithValues: environment.keys.map { ($0, getenv($0).map { String(cString: $0) }) })
+    let before = Dictionary(uniqueKeysWithValues: environment.keys.map { ($0, getenv($0).map { String(cString: $0) as Any } ?? NSNull()) })
+    if let data = try? JSONSerialization.data(withJSONObject: before) { setenv(ledger, String(decoding: data, as: UTF8.self), 1) }
     for (key, value) in environment { setenv(key, value, 1) }
     let arguments = (app.value(forKey: "launchArguments") as? [String]) ?? []
-    if __peekLaunchArguments.isEmpty, !arguments.isEmpty,
-       // The concrete class: since iOS 17 ProcessInfo is a Swift subclass with its own getter.
-       let method = class_getInstanceMethod(object_getClass(ProcessInfo.processInfo), #selector(getter: ProcessInfo.arguments)) {
-        let original = ProcessInfo.processInfo.arguments
-        let combined: @convention(block) (AnyObject) -> NSArray = { _ in (original + __peekLaunchArguments) as NSArray }
+    // The concrete class: since iOS 17 ProcessInfo is a Swift subclass with its own getter.
+    if !__peekArgumentsHooked, let cls = object_getClass(ProcessInfo.processInfo),
+       let original = __peekOriginal(cls, "arguments"),
+       let method = class_getInstanceMethod(cls, #selector(getter: ProcessInfo.arguments)) {
+        typealias Get = @convention(c) (AnyObject, Selector) -> NSArray
+        let combined: @convention(block) (AnyObject) -> NSArray = { info in
+            let own = unsafeBitCast(original, to: Get.self)(info, #selector(getter: ProcessInfo.arguments)) as? [String] ?? []
+            return (own + __peekLaunchArguments) as NSArray
+        }
         method_setImplementation(method, imp_implementationWithBlock(combined))
+        __peekArgumentsHooked = true
     }
     __peekLaunchArguments = arguments
     var defaults: [String: Any] = [:]
@@ -3149,14 +3179,16 @@ class Hub:
         self.shot = 0  # screenshot requests so far; the phone answers each one
         self.shots = {}  # request number -> PNG bytes
         self.report = TestReport()  # results of the test run in progress (`peek test`)
+        self.report_lock = threading.Lock()  # log requests arrive on several threads
         self.finished = None  # exit code of the first finished test run, for `peek test --once`
 
     def test_output(self, line):
         """Collects test results; at the end of a run writes --junit and ends a --once run."""
-        code = self.report.feed(line)
-        if code is None:
-            return
-        report, self.report = self.report, TestReport()
+        with self.report_lock:
+            code = self.report.feed(line)
+            if code is None:
+                return
+            report, self.report = self.report, TestReport()
         junit = self.builder.junit
         if junit:
             try:
@@ -3579,9 +3611,17 @@ def load_token():
     return path.read_text().strip()
 
 
+def proxied(host):
+    """A host given with its own port is a reverse proxy in front of the server, not one of its addresses."""
+    return re.fullmatch(r"[^:\[\]]+:\d+", host) is not None
+
+
+def host_port(host, port):
+    return host if proxied(host) else f"{host}:{port}"
+
+
 def pairing_link(hosts, port, token):
-    # A host may carry its own port (a reverse proxy in front of the server, say).
-    query = [("h", h if re.fullmatch(r"[^:\[\]]+:\d+", h) else f"{h}:{port}") for h in hosts] + [("k", token)]
+    query = [("h", host_port(h, port)) for h in hosts] + [("k", token)]
     return "peek://connect?" + urllib.parse.urlencode(query, safe=":")
 
 
@@ -3610,8 +3650,10 @@ def cmd_dev(args):
     if args.bind:
         binds = [args.bind]
     else:
-        binds = sorted({h for h in hosts if h in local_addresses() or h == "127.0.0.1"} | {"127.0.0.1"})
-        if any(h not in binds for h in hosts):  # --host is not a local address (NAT): listen everywhere
+        # A reverse proxy (host:port) reaches the server on loopback, which is always bound.
+        direct = [h for h in hosts if not proxied(h)]
+        binds = sorted({h for h in direct if h in local_addresses() or h == "127.0.0.1"} | {"127.0.0.1"})
+        if any(h not in binds for h in direct):  # --host is not a local address (NAT): listen everywhere
             binds = ["0.0.0.0"]
     handler = make_handler(hub)
     for address in binds:
@@ -3634,7 +3676,7 @@ def cmd_dev(args):
     if lan and not args.no_discovery:
         advertiser = Advertiser(builder.name, args.port, lan, {
             "id": derive(token, "peek-id").hex()[:8],
-            "hosts": ",".join(f"{h}:{args.port}" for h in hosts),
+            "hosts": ",".join(host_port(h, args.port) for h in hosts),
         })
 
     # Lets `peek shot` find this server.

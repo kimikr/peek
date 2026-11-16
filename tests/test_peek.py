@@ -694,6 +694,17 @@ class Server(unittest.TestCase):
         self.assertEqual(json.loads(self.call("POST", "/v1/log", body=body)), {})
 
 
+class ProxiedHosts(unittest.TestCase):
+    def test_host_with_port_is_a_proxy(self):
+        self.assertTrue(peek.proxied("peek.example.com:80"))
+        self.assertFalse(peek.proxied("100.64.0.1"))
+        self.assertFalse(peek.proxied("fd7a:115c::1"))  # IPv6, not host:port
+        self.assertEqual(peek.host_port("peek.example.com:80", 8765), "peek.example.com:80")
+        self.assertEqual(peek.host_port("100.64.0.1", 8765), "100.64.0.1:8765")
+        link = peek.pairing_link(["100.64.0.1", "peek.example.com:80"], 8765, "ab")
+        self.assertIn("h=100.64.0.1:8765&h=peek.example.com:80&k=ab", link)
+
+
 class TestReportParsing(unittest.TestCase):
     LINES = """Test Case '-[PeekBuild_bf289e_1.DeviceUITests testRotation]' started.
 Tests/CalcTests/TallyUITests.swift:117: error: -[PeekBuild_bf289e_1.DeviceUITests testRotation] : XCTAssertGreaterThan failed: ("393.0") is not greater than ("852.0")
