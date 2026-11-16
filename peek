@@ -940,7 +940,7 @@ let __peekTargetBundleIdentifier = %TARGETBUNDLE%
     let suite = XCTestSuite(name: "All tests")
     let filter = __peekTestFilter.isEmpty ? nil : try? NSRegularExpression(pattern: __peekTestFilter)
     if !__peekTestFilter.isEmpty, filter == nil {
-        print("peek: --filter is not a valid regular expression: \(__peekTestFilter)")
+        print("peek: --filter is not a valid regular expression: \\(__peekTestFilter)")
         return false
     }
     for testClass in classes.sorted(by: { NSStringFromClass($0) < NSStringFromClass($1) }) {
@@ -1747,12 +1747,31 @@ def asset_colors(catalogs):
 
 def _uicolor(spec):
     if spec[0] == "system":
-        return (f'((UIColor.self as AnyObject).perform(NSSelectorFromString({json.dumps(spec[1])}))?'
+        return (f'((UIColor.self as AnyObject).perform(NSSelectorFromString({swift_string(spec[1])}))?'
                 f'.takeUnretainedValue() as? UIColor ?? .clear)')
     kind, r, g, b, a = spec
     if kind == "display-p3":
         return f"UIColor(displayP3Red: {r:.4f}, green: {g:.4f}, blue: {b:.4f}, alpha: {a:.4f})"
     return f"UIColor(red: {r:.4f}, green: {g:.4f}, blue: {b:.4f}, alpha: {a:.4f})"
+
+
+def swift_string(text):
+    """A Swift string literal for text (JSON's \\u00fc escapes are not Swift: asset names like "Mensa Brühl")."""
+    out = []
+    for ch in text:
+        if ch in '"\\':
+            out.append("\\" + ch)
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{{{ord(ch):x}}}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
 
 
 def colors_source(colors):
@@ -1762,7 +1781,7 @@ def colors_source(colors):
         value = _uicolor(looks["any"])
         if "dark" in looks:
             value = (f"UIColor {{ $0.userInterfaceStyle == .dark ? {_uicolor(looks['dark'])} : {value} }}")
-        cases.append(f"    case {json.dumps(name)}: return {value}")
+        cases.append(f"    case {swift_string(name)}: return {value}")
     return ("\n// Colour sets from the asset catalogs (Assets.car cannot be compiled without a Mac).\n"
             "func __peekUIColor(_ name: String) -> UIColor? {\n    switch name {\n" + "\n".join(cases)
             + "\n    default: return nil\n    }\n}\n\n"
@@ -1821,17 +1840,17 @@ def asset_symbols_source(colors, images, has_bundle):
     bundle = "Foundation.Bundle.module" if has_bundle else "Foundation.Bundle.main"
     lines = ["\n// Asset symbols (Xcode generates these from the asset catalogs).",
              "@available(iOS 17.0, *) extension DeveloperToolsSupport.ColorResource {"]
-    lines += [f"    static let {s} = DeveloperToolsSupport.ColorResource(name: {json.dumps(n)}, bundle: {bundle})"
+    lines += [f"    static let {s} = DeveloperToolsSupport.ColorResource(name: {swift_string(n)}, bundle: {bundle})"
               for n, s in color_symbols.items()]
     lines += ["}", "@available(iOS 17.0, *) extension DeveloperToolsSupport.ImageResource {"]
-    lines += [f"    static let {s} = DeveloperToolsSupport.ImageResource(name: {json.dumps(n)}, bundle: {bundle})"
+    lines += [f"    static let {s} = DeveloperToolsSupport.ImageResource(name: {swift_string(n)}, bundle: {bundle})"
               for n, s in image_symbols.items()]
     lines += ["}",
               "@available(iOS 17.0, *) let __peekColorNames: [DeveloperToolsSupport.ColorResource: String] = "
-              f"Dictionary(uniqueKeysWithValues: {json.dumps(list(color_symbols))}.map "
+              f"Dictionary(uniqueKeysWithValues: [{', '.join(swift_string(x) for x in color_symbols)}].map "
               f"{{ (DeveloperToolsSupport.ColorResource(name: $0, bundle: {bundle}), $0) }})",
               "@available(iOS 17.0, *) let __peekImageNames: [DeveloperToolsSupport.ImageResource: String] = "
-              f"Dictionary(uniqueKeysWithValues: {json.dumps(list(image_symbols))}.map "
+              f"Dictionary(uniqueKeysWithValues: [{', '.join(swift_string(x) for x in image_symbols)}].map "
               f"{{ (DeveloperToolsSupport.ImageResource(name: $0, bundle: {bundle}), $0) }})",
               "@available(iOS 17.0, *) extension SwiftUI.Color {",
               "    init(_ resource: DeveloperToolsSupport.ColorResource) {",
@@ -1861,18 +1880,18 @@ def asset_symbols_source(colors, images, has_bundle):
     shortcuts = {n: s for n, s in color_symbols.items() if s.strip("`") not in SYSTEM_COLOR_NAMES}
     if shortcuts:
         lines.append("extension SwiftUI.Color {")
-        lines += [f"    static var {s}: SwiftUI.Color {{ __peekColor({json.dumps(n)}) }}" for n, s in shortcuts.items()]
+        lines += [f"    static var {s}: SwiftUI.Color {{ __peekColor({swift_string(n)}) }}" for n, s in shortcuts.items()]
         # Disfavoured so that `Color(.name)` picks the ColorResource in patches (another module) too.
         lines += ["}", "extension SwiftUI.ShapeStyle where Self == SwiftUI.Color {"]
-        lines += [f"    @_disfavoredOverload static var {s}: SwiftUI.Color {{ __peekColor({json.dumps(n)}) }}"
+        lines += [f"    @_disfavoredOverload static var {s}: SwiftUI.Color {{ __peekColor({swift_string(n)}) }}"
                   for n, s in shortcuts.items()]
         lines += ["}", "extension UIKit.UIColor {"]
-        lines += [f"    static var {s}: UIKit.UIColor {{ __peekUIColor({json.dumps(n)}) ?? .clear }}"
+        lines += [f"    static var {s}: UIKit.UIColor {{ __peekUIColor({swift_string(n)}) ?? .clear }}"
                   for n, s in shortcuts.items()]
         lines.append("}")
     if image_symbols:
         lines.append("extension UIKit.UIImage {")
-        lines += [f"    static var {s}: UIKit.UIImage {{ UIImage(named: {json.dumps(n)}, in: {bundle}, with: nil) ?? UIImage() }}"
+        lines += [f"    static var {s}: UIKit.UIImage {{ UIImage(named: {swift_string(n)}, in: {bundle}, with: nil) ?? UIImage() }}"
                   for n, s in image_symbols.items()]
         lines.append("}")
     return "\n".join(lines) + "\n"
@@ -2340,7 +2359,7 @@ class Builder:
                                                       for p in test_files)
         tested = {self.package.target, re.sub(r"\W", "_", self.package.target)} if self.package else set()
         for path in sources:
-            shown = path.name if self.single else str(path.relative_to(self.root))
+            shown = path.name if self.single else os.path.relpath(path, self.root)  # sources may sit outside it (a linked folder)
             tag = hashlib.sha1(shown.encode()).hexdigest()[:8]
             text = texts[path]
             if path in test_files:
@@ -2379,9 +2398,9 @@ class Builder:
         write_if_changed(support, SUPPORT_SOURCE + (BUNDLE_TEMPLATE.replace("%NAME%", bundle_name) if bundle_name else "")
                          + colors_source(self.colors)
                          + ("" if own_symbols else asset_symbols_source(self.colors, self.images, bool(bundle_name)))
-                         + (TEST_RUNNER_SOURCE.replace("%FILTER%", json.dumps(self.test_filter or "", ensure_ascii=False))
+                         + (TEST_RUNNER_SOURCE.replace("%FILTER%", swift_string(self.test_filter or ""))
                             .replace("%XCTEST%", XCTEST_RUNNER.replace("%UITESTS%", "true" if self.uses_ui_tests else "false")
-                                                    .replace("%TARGETBUNDLE%", json.dumps(self.target_bundle_identifier()))
+                                                    .replace("%TARGETBUNDLE%", swift_string(self.target_bundle_identifier()))
                                                     if self.uses_xctest else XCTEST_NONE)
                             if self.tests else ""))
         write_if_changed(entry, ENTRY_TEMPLATE.replace("%CASES%", body))

@@ -694,6 +694,21 @@ class Server(unittest.TestCase):
         self.assertEqual(json.loads(self.call("POST", "/v1/log", body=body)), {})
 
 
+class ScriptHygiene(unittest.TestCase):
+    def test_no_invalid_escapes(self):
+        # Swift interpolations in the templates need "\\(" in Python strings; "\(" warns on every run.
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            compile((ROOT / "peek").read_text(), "peek", "exec")
+
+
+class SwiftStrings(unittest.TestCase):
+    def test_non_ascii_and_escapes(self):
+        self.assertEqual(peek.swift_string('Mensa Brühl'), '"Mensa Brühl"')
+        self.assertEqual(peek.swift_string('a"b\\c\nd\x01'), '"a\\"b\\\\c\\nd\\u{1}"')
+
+
 class ProxiedHosts(unittest.TestCase):
     def test_host_with_port_is_a_proxy(self):
         self.assertTrue(peek.proxied("peek.example.com:80"))
