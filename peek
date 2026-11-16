@@ -819,7 +819,8 @@ struct __PeekTestRunner: SwiftUI.View {
                 return await __swiftPMEntryPoint(passing: arguments)
             }.value
             seconds = Date().timeIntervalSince(started)
-            result = xctestPassed ? code : max(code, 1)
+            let swiftTesting = code == 69 ? 0 : code  // 69: no Swift Testing tests in this target
+            result = xctestPassed ? swiftTesting : max(swiftTesting, 1)
             print(result == 0 ? "peek: all tests passed" : "peek: tests failed")
         }
     }
@@ -833,6 +834,8 @@ XCTEST_NONE = """
 XCTEST_RUNNER = """
 import XCTest
 import ObjectiveC
+
+let __peekUsesUITesting = %UITESTS%
 
 /// Runs the XCTestCase subclasses defined in this build and prints XCTest's usual log. Only this
 /// library's classes are looked at: earlier builds stay loaded, and touching arbitrary classes of
@@ -852,13 +855,80 @@ import ObjectiveC
         if parent != nil { classes.append(candidate) }
     }
     if classes.isEmpty { return true }
-    __peekWithoutTestDaemon()
+    if __peekUsesUITesting {
+        __peekPrepareUITesting()
+        __peekStartAccessibility()
+    } else {
+        __peekWithoutTestDaemon()
+    }
     let suite = XCTestSuite(name: "All tests")
     for testClass in classes.sorted(by: { NSStringFromClass($0) < NSStringFromClass($1) }) {
         suite.addTest(XCTestSuite(forTestCaseClass: testClass))
     }
     suite.run()
     return suite.testRun?.hasSucceeded ?? false
+}
+
+/// UI tests (XCUIApplication) need testmanagerd, which the developer disk image brings (mount
+/// it with StikDebug or Xcode). Xcode would also hand the runner a UI-testing configuration and
+/// turn on Automation Mode; peek does both itself. iOS 27 renamed the daemon's Mach service.
+@MainActor func __peekPrepareUITesting() {
+    guard FileManager.default.fileExists(atPath: "/System/Developer/usr/libexec/testmanagerd") else {
+        print("peek: UI tests need the developer disk image (testmanagerd); mount it with StikDebug, then reopen Peek")
+        return
+    }
+    if let session = NSClassFromString("XCTRunnerDaemonSession"),
+       let method = class_getClassMethod(session, NSSelectorFromString("testmanagerdServiceName")) {
+        let name: @convention(block) (AnyObject) -> NSString = { _ in "com.apple.dt.testmanagerd.runner" }
+        method_setImplementation(method, imp_implementationWithBlock(name))
+    }
+    if let configClass = NSClassFromString("XCTestConfiguration") as? NSObject.Type {
+        let config = configClass.init()
+        config.setValue(true, forKey: "initializeForUITesting")
+        _ = (configClass as AnyObject).perform(NSSelectorFromString("setActiveTestConfiguration:"), with: config)
+    }
+    typealias IsEnabled = @convention(c) () -> Bool
+    let handle = dlopen("/System/Library/PrivateFrameworks/AutomationMode.framework/AutomationMode", RTLD_NOW)
+    let isEnabled = dlsym(handle, "XAMIsAutomationModeEnabled").map { unsafeBitCast($0, to: IsEnabled.self) }
+    print("peek: Automation Mode was \(isEnabled?() == true ? "on" : "off")")
+    if isEnabled?() == true { return }
+    let device = XCUIDevice.shared
+    let selector = NSSelectorFromString("enableAutomationMode:")
+    guard let method = class_getInstanceMethod(object_getClass(device), selector) else { return }
+    typealias Enable = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<NSError?>?) -> Bool
+    var error: NSError?
+    let ok = unsafeBitCast(method_getImplementation(method), to: Enable.self)(device, selector, &error)
+    print("peek: Automation Mode \(ok ? "requested" : "not enabled: \(error?.localizedDescription ?? "unknown error")")")
+    // The passcode prompt may still be up; wait for the mode to actually switch on.
+    let deadline = Date().addingTimeInterval(60)
+    while isEnabled?() == false, Date() < deadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+    }
+    print("peek: Automation Mode is \(isEnabled?() == true ? "on" : "still off")")
+}
+
+/// XCUITest reads an app through its accessibility server, which apps start only when launched
+/// with accessibility or automation on. Peek was already running, so start it here and wait
+/// until UIKit's accessibility bundle is loaded.
+@MainActor func __peekStartAccessibility() {
+    typealias SetFlag = @convention(c) (Bool) -> Void
+    let library = dlopen("/usr/lib/libAccessibility.dylib", RTLD_NOW)
+    for name in ["_AXSSetAutomationEnabled", "_AXSApplicationAccessibilitySetEnabled"] {
+        if let symbol = dlsym(library, name) { unsafeBitCast(symbol, to: SetFlag.self)(true) }
+    }
+    // What UIKit runs at launch when accessibility is on.
+    typealias Initialize = @convention(c) () -> Void
+    if let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_UIAccessibilityInitialize") {
+        unsafeBitCast(symbol, to: Initialize.self)()
+    }
+    func loaded() -> Bool { Bundle.allBundles.contains { $0.bundlePath.hasSuffix("UIKit.axbundle") } }
+    let deadline = Date().addingTimeInterval(15)
+    while !loaded(), Date() < deadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+    }
+    // Give the server a moment to register once the bundles are in.
+    RunLoop.current.run(until: Date().addingTimeInterval(1))
+    print("peek: accessibility \(loaded() ? "ready" : "not loaded yet")")
 }
 
 /// XCTest connects to testmanagerd, which only runs when Xcode has set the phone up for
@@ -1566,7 +1636,7 @@ class Builder:
         self.package_error = None
         self.colors, self.images = {}, set()
         self.display_names = {}
-        self.uses_xctest = False
+        self.uses_xctest = self.uses_ui_tests = False
 
     @property
     def ios(self):
@@ -1845,6 +1915,8 @@ class Builder:
                                                 "package, or in Tests/ next to Sources/)."}
         self.uses_xctest = any(re.search(r"^[ \t]*(?:@testable[ \t]+)?import[ \t]+XCTest\b", texts[p], re.M)
                                for p in test_files)
+        self.uses_ui_tests = self.uses_xctest and any(re.search(r"\bXCUI(?:Application|Device|Element)\b", code_mask(texts[p]))
+                                                      for p in test_files)
         tested = {self.package.target, re.sub(r"\W", "_", self.package.target)} if self.package else set()
         for path in sources:
             shown = path.name if self.single else str(path.relative_to(self.root))
@@ -1884,7 +1956,8 @@ class Builder:
         write_if_changed(support, SUPPORT_SOURCE + (BUNDLE_TEMPLATE.replace("%NAME%", bundle_name) if bundle_name else "")
                          + colors_source(self.colors)
                          + ("" if own_symbols else asset_symbols_source(self.colors, self.images, bool(bundle_name)))
-                         + (TEST_RUNNER_SOURCE.replace("%XCTEST%", XCTEST_RUNNER if self.uses_xctest else XCTEST_NONE)
+                         + (TEST_RUNNER_SOURCE.replace("%XCTEST%", XCTEST_RUNNER.replace("%UITESTS%", "true" if self.uses_ui_tests else "false")
+                                                    if self.uses_xctest else XCTEST_NONE)
                             if self.tests else ""))
         write_if_changed(entry, ENTRY_TEMPLATE.replace("%CASES%", body))
         files = [c for c, _ in inputs] + [support, entry]
@@ -3037,7 +3110,8 @@ def load_token():
 
 
 def pairing_link(hosts, port, token):
-    query = [("h", f"{h}:{port}") for h in hosts] + [("k", token)]
+    # A host may carry its own port (a reverse proxy in front of the server, say).
+    query = [("h", h if re.fullmatch(r"[^:\[\]]+:\d+", h) else f"{h}:{port}") for h in hosts] + [("k", token)]
     return "peek://connect?" + urllib.parse.urlencode(query, safe=":")
 
 
