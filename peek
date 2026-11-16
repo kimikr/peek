@@ -818,8 +818,10 @@ nonisolated(unsafe) var __peekFailedTests: [String] = []
 }
 
 struct __PeekTestRunner: SwiftUI.View {
-    /// The app under UI tests: shown full screen while they drive it. nil for unit tests only.
-    var app: SwiftUI.AnyView? = nil
+    /// Makes the app under UI tests, shown full screen while they drive it; nil for unit tests
+    /// only. Made again on each launch(), after its launch options: apps read them in init().
+    var makeApp: (() -> SwiftUI.AnyView)? = nil
+    @SwiftUI.State private var app: SwiftUI.AnyView?
     @SwiftUI.State private var result: CInt?
     @SwiftUI.State private var started = Date()
     @SwiftUI.State private var seconds = 0.0
@@ -830,13 +832,15 @@ struct __PeekTestRunner: SwiftUI.View {
 
     var body: some SwiftUI.View {
         SwiftUI.Group {
-            if let app {
+            if let makeApp {
                 SwiftUI.Group {
                     if terminated { SwiftUI.Color.black.ignoresSafeArea() } else { app.id(launches) }  // launch() starts it afresh
                 }
+                    .onAppear { if app == nil { app = makeApp() } }  // once, not on every redraw of this view
                     .overlay(alignment: .top) { status.allowsHitTesting(false).accessibilityHidden(true) }
                     .onReceive(NotificationCenter.default.publisher(for: __peekRelaunchNotification)) { _ in
                         terminated = false
+                        app = makeApp()
                         launches += 1
                     }
                     .onReceive(NotificationCenter.default.publisher(for: __peekTerminateNotification)) { _ in terminated = true }
@@ -1214,6 +1218,16 @@ nonisolated(unsafe) var __peekActivate: (AnyObject) -> Void = { _ in }
 /// Hooks ProcessInfo.arguments for this build (once): the process's own arguments, then those of
 /// the last launch().
 nonisolated(unsafe) var __peekArgumentsHooked = false
+/// The process's own arguments, before any launch() added to CommandLine.arguments (kept
+/// process-wide: a later build's runner must not take the previous launch's for its own).
+nonisolated(unsafe) var __peekOwnCommandLine: [String]? = {
+    guard let saved = getenv("PEEK_OWN_COMMAND_LINE") else {
+        let own = CommandLine.arguments
+        if let data = try? JSONSerialization.data(withJSONObject: own) { setenv("PEEK_OWN_COMMAND_LINE", String(decoding: data, as: UTF8.self), 1) }
+        return own
+    }
+    return (try? JSONSerialization.jsonObject(with: Data(String(cString: saved).utf8))) as? [String]
+}()
 
 func __peekApplyLaunchOptions(_ app: AnyObject) {
     // Variables the last launch() set (by any build, so kept in the environment itself) are
@@ -1242,6 +1256,12 @@ func __peekApplyLaunchOptions(_ app: AnyObject) {
         __peekArgumentsHooked = true
     }
     __peekLaunchArguments = arguments
+    // Apps also read CommandLine.arguments (argv), which ProcessInfo's getter does not cover.
+    // Its setter is unavailable in Swift 6 language mode, so call it by its symbol.
+    typealias SetArguments = @convention(thin) (__owned [String]) -> Void
+    if let setter = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "$ss11CommandLineO9argumentsSaySSGvsZ") {
+        unsafeBitCast(setter, to: SetArguments.self)((__peekOwnCommandLine ?? []) + arguments)
+    }
     var defaults: [String: Any] = [:]
     var index = 0
     while index < arguments.count {
@@ -2406,7 +2426,7 @@ class Builder:
                         "Add `#Preview { MyView() }` or pass --root \"MyView()\"."}
             cases = [(f"{pick}()", pick)]
         if self.tests and self.uses_ui_tests:  # UI tests drive the app the previews would show
-            cases = [(f"__PeekTestRunner(app: AnyView({cases[0][0]}))", "UI tests")]
+            cases = [(f"__PeekTestRunner(makeApp: {{ AnyView({cases[0][0]}) }})", "UI tests")]
         body = "\n".join(
             f"        case {i}: return UIHostingController(rootView: AnyView(__PeekGenerationRoot(content: AnyView({expr}))))"
             for i, (expr, _) in enumerate(cases))
