@@ -249,10 +249,12 @@ final class TallyUITests: XCTestCase {
 
 While they run, the phone shows the app being tested (its first `#Preview`,
 or the `@main` App) and the tests drive it: taps, typing, swipes, long
-presses, toggles and sliders, the home button, rotation
+presses, pinch and two-finger rotation, taps at coordinates, toggles and
+sliders, the home button, rotation
 (`XCUIDevice.shared.orientation`), screenshots, system alerts (through
 `XCUIApplication(bundleIdentifier: "com.apple.springboard")`), and other apps
-such as Settings. `XCUIApplication()` is the app in Peek; `launch()` starts it
+such as Settings (`launch()` brings another app to the front, `terminate()`
+quits it). `measure {}` works in unit tests. `XCUIApplication()` is the app in Peek; `launch()` starts it
 afresh with its `launchArguments` (also as `UserDefaults`) and
 `launchEnvironment`, and `terminate()` takes it off screen (its state is then
 `.notRunning`) until `launch()` or `activate()`. See `examples/Calculator/Tests/CalcTests/TallyUITests.swift`.

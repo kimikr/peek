@@ -882,6 +882,7 @@ struct __PeekTestRunner: SwiftUI.View {
             }
             setenv("PEEK_TESTS_RUNNING", "1", 1)
             defer { unsetenv("PEEK_TESTS_RUNNING") }
+            print("peek: tests started")  // the server starts a new report (an earlier run may have been cut short)
             started = Date()
             let module = String(reflecting: __PeekTestRunner.self).split(separator: ".")[0]
             // Started from a run loop callback, not from this main-queue job: while XCTest waits
@@ -2731,6 +2732,9 @@ class TestReport:
     def feed(self, line):
         """Takes one output line; returns 0 or 1 once the run has finished, else None."""
         line = line.strip()
+        if line == "peek: tests started":
+            self.cases, self.issues = [], {}
+            return None
         if line in self.DONE:
             return self.DONE[line]
         m = self.XCTEST_ISSUE.match(line)

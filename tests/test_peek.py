@@ -730,6 +730,12 @@ peek: tests failed""".splitlines()
         self.assertEqual(device.get("tests"), "2")
         self.assertIn("852.0", device.find("testcase[@name='testRotation']/failure").get("message"))
 
+    def test_cut_short_run_is_dropped(self):
+        report = peek.TestReport()
+        for line in self.LINES[:4] + ["peek: tests started", "Test Case '-[M.A testB]' passed (0.1 seconds).", "peek: all tests passed"]:
+            report.feed(line)
+        self.assertEqual([c[1] for c in report.cases], ["testB"])
+
     def test_passing_run(self):
         self.assertEqual(peek.TestReport().feed("peek: all tests passed"), 0)
 
