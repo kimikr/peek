@@ -1158,18 +1158,28 @@ func __peekIsTarget(_ app: AnyObject) -> Bool {
     return (app.value(forKey: "bundleID") as? String).map { $0 == __peekTargetBundle } ?? true
 }
 
-/// Lets the run loop turn for `minimum` seconds and then while a scroll view is still moving (3 s at most).
+/// What XCTest's wait for an idle app does here: lets the run loop turn for `minimum` seconds,
+/// then until no scroll view is moving and the view tree has stopped changing (a new tab or
+/// pushed screen draws over several passes), 3 s at most.
 @MainActor func __peekSettle(_ minimum: Double) {
     RunLoop.current.run(until: Date().addingTimeInterval(minimum))
-    func moving(_ view: UIView) -> Bool {
-        if let scroll = view as? UIScrollView, scroll.isDragging || scroll.isDecelerating { return true }
-        return view.subviews.contains(where: moving)
+    var moving = false
+    func count(_ view: UIView) -> Int {
+        if let scroll = view as? UIScrollView, scroll.isDragging || scroll.isDecelerating { moving = true }
+        return 1 + view.subviews.reduce(0) { $0 + count($1) }
     }
+    var last = -1, steady = 0
     let deadline = Date().addingTimeInterval(3)
-    while Date() < deadline, UIApplication.shared.connectedScenes.contains(where: {
-        ($0 as? UIWindowScene)?.windows.contains(where: moving) ?? false
-    }) {
-        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+    while Date() < deadline {
+        moving = false
+        var views = 0
+        for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
+            views += scene.windows.reduce(0) { $0 + count($1) }
+        }
+        steady = !moving && views == last ? steady + 1 : 0
+        last = views
+        if steady >= 2 { break }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
     }
 }
 
