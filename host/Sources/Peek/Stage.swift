@@ -11,6 +11,10 @@ final class Stage {
     private var window: UIWindow?
     private var handle: HandleWindow?
     private weak var errorSheet: UIViewController?
+    /// Overrides Peek put on the preview's root. Only those are removed again: SwiftUI stores the
+    /// app's own `.preferredColorScheme` there too.
+    private var overridesStyle = false
+    private var overridesSize = false
 
     private var scene: UIWindowScene? {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
@@ -31,6 +35,8 @@ final class Stage {
         if window.rootViewController !== controller {
             window.rootViewController?.dismiss(animated: false)
             window.rootViewController = controller
+            overridesStyle = false  // a fresh controller carries none of ours
+            overridesSize = false
         }
         window.makeKeyAndVisible()
         self.window = window
@@ -51,17 +57,19 @@ final class Stage {
     /// phone's settings. Peek's own sheets reset them in `present`.
     func applyDisplay(_ session: Session, report: Bool = false) {
         guard let window, let controller = window.rootViewController else { return }
-        if session.appearance == .system {
-            if controller.traitOverrides.contains(UITraitUserInterfaceStyle.self) {
-                controller.traitOverrides.remove(UITraitUserInterfaceStyle.self)
-            }
-        } else {
+        if session.appearance != .system {
             controller.traitOverrides.userInterfaceStyle = session.appearance.style
+            overridesStyle = true
+        } else if overridesStyle {
+            controller.traitOverrides.remove(UITraitUserInterfaceStyle.self)
+            overridesStyle = false
         }
         if let category = session.textSize.category {
             controller.traitOverrides.preferredContentSizeCategory = category
-        } else if controller.traitOverrides.contains(UITraitPreferredContentSizeCategory.self) {
+            overridesSize = true
+        } else if overridesSize {
             controller.traitOverrides.remove(UITraitPreferredContentSizeCategory.self)
+            overridesSize = false
         }
         // Trait changes reach the preview on the next layout pass, so read them back after it.
         if report { DispatchQueue.main.async { [weak window, weak session] in
