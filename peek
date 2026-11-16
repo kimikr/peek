@@ -994,6 +994,15 @@ func __peekTestName(_ test: XCTest) -> String {
 }
 
 final class __PeekFailureObserver: NSObject, XCTestObservation {
+    /// The first failure of a UI test prints what the app showed, as Xcode attaches it to the result.
+    private var dumped: Set<String> = []
+
+    func testCase(_ testCase: XCTestCase, didRecord issue: XCTIssue) {
+        guard __peekUsesUITesting, dumped.insert(testCase.name).inserted else { return }
+        let tree = XCUIApplication().debugDescription.split(separator: "\\n").prefix(150).joined(separator: "\\n")
+        print("peek: the app's screen when \\(__peekTestName(testCase)) failed:\\n\\(tree)")
+    }
+
     func testCaseDidFinish(_ testCase: XCTestCase) {
         if let run = testCase.testRun, !run.hasSucceeded { __peekFailedTests.append(__peekTestName(testCase)) }
     }
