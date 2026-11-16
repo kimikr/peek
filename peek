@@ -1056,7 +1056,7 @@ final class __PeekFailureObserver: NSObject, XCTestObservation {
     typealias IsEnabled = @convention(c) () -> Bool
     let handle = dlopen("/System/Library/PrivateFrameworks/AutomationMode.framework/AutomationMode", RTLD_NOW)
     let isEnabled = dlsym(handle, "XAMIsAutomationModeEnabled").map { unsafeBitCast($0, to: IsEnabled.self) }
-    print("peek: Automation Mode was \(isEnabled?() == true ? "on" : "off")")
+    print("peek: Automation Mode was \\(isEnabled?() == true ? "on" : "off")")
     if isEnabled?() == true { return }
     let device = XCUIDevice.shared
     let selector = NSSelectorFromString("enableAutomationMode:")
@@ -1066,13 +1066,13 @@ final class __PeekFailureObserver: NSObject, XCTestObservation {
     __peekNotice("Enter your passcode to allow Automation Mode for the UI tests")
     defer { __peekNotice(isEnabled?() == true ? nil : "Automation Mode is off, so UI tests cannot drive the app") }
     let ok = unsafeBitCast(method_getImplementation(method), to: Enable.self)(device, selector, &error)
-    print("peek: Automation Mode \(ok ? "requested" : "not enabled: \(error?.localizedDescription ?? "unknown error")")")
+    print("peek: Automation Mode \\(ok ? "requested" : "not enabled: \\(error?.localizedDescription ?? "unknown error")")")
     // The passcode prompt may still be up; wait for the mode to actually switch on.
     let deadline = Date().addingTimeInterval(60)
     while isEnabled?() == false, Date() < deadline {
         RunLoop.current.run(until: Date().addingTimeInterval(0.25))
     }
-    print("peek: Automation Mode is \(isEnabled?() == true ? "on" : "still off")")
+    print("peek: Automation Mode is \\(isEnabled?() == true ? "on" : "still off")")
 }
 
 /// launchArguments and launchEnvironment of XCUIApplication, applied to this process the way a
@@ -1142,7 +1142,7 @@ func __peekApplyLaunchOptions(_ app: AnyObject) {
             location = manager
             kept.append("location updates")
         }
-        print("peek: kept alive in the background by \(kept.joined(separator: ", ")) (host background modes: \(modes))")
+        print("peek: kept alive in the background by \\(kept.joined(separator: ", ")) (host background modes: \\(modes))")
     }
 
     func stop() {
@@ -1202,7 +1202,7 @@ func __peekApplyLaunchOptions(_ app: AnyObject) {
     }
     // Give the server a moment to register once the bundles are in.
     RunLoop.current.run(until: Date().addingTimeInterval(1))
-    print("peek: accessibility \(loaded() ? "ready" : "not loaded yet")")
+    print("peek: accessibility \\(loaded() ? "ready" : "not loaded yet")")
 }
 
 /// XCTest connects to testmanagerd, which only runs when Xcode has set the phone up for
