@@ -19,21 +19,6 @@ struct TallyView: View {
                     Button("Reset", role: .destructive) { count = 0 }
                 }
                 Section {
-                    // Coordinate taps, pinch and two-finger rotation (TallyUITests.testPad*).
-                    GeometryReader { geo in
-                        RoundedRectangle(cornerRadius: 12).fill(.tint.opacity(0.3))
-                            .contentShape(Rectangle())
-                            .gesture(SpatialTapGesture().onEnded { side = $0.location.x < geo.size.width / 2 ? "left" : "right" })
-                    }
-                        .frame(height: 120)
-                        .accessibilityElement(children: .contain)
-                        .accessibilityIdentifier("pad")
-                        .simultaneousGesture(MagnifyGesture().onEnded { zoom = $0.magnification })
-                        .simultaneousGesture(RotateGesture().onEnded { angle = $0.rotation.degrees })
-                    Text("Tap: \(side)").accessibilityIdentifier("side")
-                    Text(String(format: "Zoom: %.1f, angle: %.0f", zoom, angle)).accessibilityIdentifier("zoom")
-                }
-                Section {
                     TextField("Your name", text: $name).accessibilityIdentifier("name")
                     Text(name.isEmpty ? "Hello!" : "Hello, \(name)!").accessibilityIdentifier("greeting")
                 }
@@ -48,6 +33,21 @@ struct TallyView: View {
                     Button("Call support") { UIApplication.shared.open(URL(string: "tel:0123456789")!) }
                 }
                 Section { BadgeView(count: count) }
+                Section {
+                    // Coordinate taps, pinch and two-finger rotation (TallyUITests.testPad*).
+                    GeometryReader { geo in
+                        RoundedRectangle(cornerRadius: 12).fill(.tint.opacity(0.3))
+                            .contentShape(Rectangle())
+                            .gesture(SpatialTapGesture().onEnded { side = $0.location.x < geo.size.width / 2 ? "left" : "right" })
+                    }
+                        .frame(height: 120)
+                        .accessibilityElement(children: .contain)
+                        .accessibilityIdentifier("pad")
+                        .simultaneousGesture(MagnifyGesture().onChanged { zoom = max(zoom, $0.magnification) })  // furthest it went
+                        .simultaneousGesture(RotateGesture().onChanged { if abs($0.rotation.degrees) > abs(angle) { angle = $0.rotation.degrees } })
+                    Text("Tap: \(side)").accessibilityIdentifier("side")
+                    Text(String(format: "Zoom: %.1f, angle: %.0f", zoom, angle)).accessibilityIdentifier("zoom")
+                }
                 Section("Rows") {
                     ForEach(1...30, id: \.self) { Text("Row \($0)") }
                 }

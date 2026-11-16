@@ -1013,8 +1013,12 @@ final class __PeekFailureObserver: NSObject, XCTestObservation {
         }
         typealias Call = @convention(c) (AnyObject, Selector) -> Void
         typealias State = @convention(c) (AnyObject, Selector) -> UInt
-        replace("launch") { original -> @convention(block) (AnyObject) -> Void in { app in
-            guard __peekIsTarget(app) else { return unsafeBitCast(original, to: Call.self)(app, NSSelectorFromString("launch")) }
+        let activate = class_getInstanceMethod(application, NSSelectorFromString("activate")).map(method_getImplementation)
+        __peekActivate = { app in activate.map { unsafeBitCast($0, to: Call.self)(app, NSSelectorFromString("activate")) } }
+        replace("launch") { _ -> @convention(block) (AnyObject) -> Void in { app in
+            // Another app launched by testmanagerd never loads its accessibility server (the test
+            // then waits 60 s and fails), so it is brought to the front instead, as activate() does.
+            guard __peekIsTarget(app) else { return __peekActivate(app) }
             __peekRelaunch(app)
         } }
         replace("activate") { original -> @convention(block) (AnyObject) -> Void in { app in
@@ -1026,6 +1030,11 @@ final class __PeekFailureObserver: NSObject, XCTestObservation {
             __peekTerminated = true
             NotificationCenter.default.post(name: __peekTerminateNotification, object: nil)
             RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        } }
+        typealias Wait = @convention(c) (AnyObject, Selector, UInt, Double) -> Bool
+        replace("waitForState:timeout:") { original -> @convention(block) (AnyObject, UInt, Double) -> Bool in { app, state, timeout in
+            if __peekIsTarget(app), __peekTerminated { return state == 1 }  // wait(for: .notRunning) after terminate()
+            return unsafeBitCast(original, to: Wait.self)(app, NSSelectorFromString("waitForState:timeout:"), state, timeout)
         } }
         replace("state") { original -> @convention(block) (AnyObject) -> UInt in { app in
             if __peekIsTarget(app), __peekTerminated { return 1 }  // XCUIApplication.State.notRunning
@@ -1110,15 +1119,28 @@ func __peekIsTarget(_ app: AnyObject) -> Bool {
     return (app.value(forKey: "bundleID") as? String).map { $0 == __peekTargetBundle } ?? true
 }
 
+/// The original XCUIApplication.activate().
+nonisolated(unsafe) var __peekActivate: (AnyObject) -> Void = { _ in }
+
 @MainActor func __peekRelaunch(_ app: AnyObject) {
+    // A test that left another app in front (or failed there) must not leave the next one
+    // driving an app in the background.
+    if UIApplication.shared.applicationState != .active { __peekActivate(app) }
     __peekTerminated = false
     __peekApplyLaunchOptions(app)
     NotificationCenter.default.post(name: __peekRelaunchNotification, object: nil)
     RunLoop.current.run(until: Date().addingTimeInterval(0.5))
 }
 
+/// Variables the last launch() set, which a real launch would not pass on to the next one.
+nonisolated(unsafe) var __peekLaunchedEnvironment: [String: String?] = [:]  // name -> value before
+
 func __peekApplyLaunchOptions(_ app: AnyObject) {
+    for (key, before) in __peekLaunchedEnvironment {
+        if let before { setenv(key, before, 1) } else { unsetenv(key) }
+    }
     let environment = (app.value(forKey: "launchEnvironment") as? [String: String]) ?? [:]
+    __peekLaunchedEnvironment = Dictionary(uniqueKeysWithValues: environment.keys.map { ($0, getenv($0).map { String(cString: $0) }) })
     for (key, value) in environment { setenv(key, value, 1) }
     let arguments = (app.value(forKey: "launchArguments") as? [String]) ?? []
     if __peekLaunchArguments.isEmpty, !arguments.isEmpty,

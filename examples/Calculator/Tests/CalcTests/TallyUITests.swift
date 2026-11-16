@@ -52,6 +52,7 @@ final class TallyUITests: XCTestCase {
         let app = XCUIApplication()
         app.launch()
         let pad = app.otherElements["pad"]
+        for _ in 0..<6 where !pad.isHittable { app.swipeUp() }  // below the first screen
         pad.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.5)).tap()
         XCTAssertEqual(app.staticTexts["side"].label, "Tap: right")
         pad.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.5)).tap()
@@ -62,6 +63,7 @@ final class TallyUITests: XCTestCase {
         let app = XCUIApplication()
         app.launch()
         let pad = app.otherElements["pad"]
+        for _ in 0..<6 where !pad.isHittable { app.swipeUp() }  // below the first screen
         pad.pinch(withScale: 2, velocity: 1)
         pad.rotate(.pi / 2, withVelocity: 1)
         let label = app.staticTexts["zoom"].label  // "Zoom: 2.0, angle: 90"
@@ -118,7 +120,7 @@ final class OtherAppUITests: XCTestCase {
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
     }
 
-    /// launch() and terminate() of another app start and end that app for real.
+    /// launch() brings another app to the front (peek cannot start it afresh); terminate() quits it.
     @MainActor func testSettingsLaunchAndTerminate() throws {
         let settings = XCUIApplication(bundleIdentifier: "com.apple.Preferences")
         settings.launch()
