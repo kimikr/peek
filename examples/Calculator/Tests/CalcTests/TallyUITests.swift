@@ -18,7 +18,11 @@ final class TallyUITests: XCTestCase {
         let field = app.textFields["name"]
         field.tap()
         field.typeText("Peek")
-        XCTAssertEqual(app.staticTexts["greeting"].label, "Hello, Peek!")
+        let greeting = app.staticTexts["greeting"]
+        let updated = expectation(for: NSPredicate(format: "label == %@", "Hello, Peek!"), evaluatedWith: greeting)
+        if XCTWaiter().wait(for: [updated], timeout: 3) != .completed {
+            XCTFail("greeting \(greeting.label), field \(field.value ?? "nil")")
+        }
     }
 
     @MainActor func testGestures() throws {

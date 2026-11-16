@@ -1178,14 +1178,24 @@ nonisolated(unsafe) var __peekActivate: (AnyObject) -> Void = { _ in }
     __peekTerminated = false
     __peekApplyLaunchOptions(app)
     NotificationCenter.default.post(name: __peekRelaunchNotification, object: nil)
-    // XCTest would now wait for the new app to settle; give its first layout passes (a Form
-    // adds its rows over several) time, as that wait is cut short here.
-    for _ in 0..<4 {
-        RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+    // XCTest would now wait for the new app to settle, a wait cut short here. Wait until its
+    // view tree stops changing instead (a Form adds its rows over several layout passes).
+    func views(_ view: UIView) -> Int { 1 + view.subviews.reduce(0) { $0 + views($1) } }
+    var last = -1, steady = 0
+    let deadline = Date().addingTimeInterval(3)
+    while steady < 3, Date() < deadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        var count = 0
         for case let scene as UIWindowScene in UIApplication.shared.connectedScenes {
-            scene.windows.forEach { $0.layoutIfNeeded() }
+            for window in scene.windows {
+                window.layoutIfNeeded()
+                count += views(window)
+            }
         }
+        steady = count == last ? steady + 1 : 0
+        last = count
     }
+    RunLoop.current.run(until: Date().addingTimeInterval(0.2))
 }
 
 /// Hooks ProcessInfo.arguments for this build (once): the process's own arguments, then those of
