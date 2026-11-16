@@ -64,3 +64,21 @@ final class TallyUITests: XCTestCase {
         XCTAssertTrue(app.buttons["Call support"].waitForExistence(timeout: 3))
     }
 }
+
+/// Another app: Peek keeps running in the background while Settings is in front.
+final class OtherAppUITests: XCTestCase {
+    @MainActor func testSettingsGeneral() throws {
+        let settings = XCUIApplication(bundleIdentifier: "com.apple.Preferences")
+        settings.activate()
+        XCTAssertTrue(settings.wait(for: .runningForeground, timeout: 10))
+        let general = settings.staticTexts["일반"].exists ? settings.staticTexts["일반"] : settings.staticTexts["General"]
+        XCTAssertTrue(general.waitForExistence(timeout: 5))
+        general.tap()
+        XCTAssertTrue(settings.navigationBars.firstMatch.waitForExistence(timeout: 5))
+        print("Settings now shows: \(settings.navigationBars.firstMatch.identifier)")
+        settings.navigationBars.buttons.firstMatch.tap()  // back
+        let app = XCUIApplication()
+        app.activate()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+    }
+}

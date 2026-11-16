@@ -875,6 +875,8 @@ XCTEST_NONE = """
 XCTEST_RUNNER = """
 import XCTest
 import ObjectiveC
+import AVFoundation
+import CoreLocation
 
 let __peekUsesUITesting = %UITESTS%
 let __peekTargetBundleIdentifier = %TARGETBUNDLE%
@@ -900,6 +902,7 @@ let __peekTargetBundleIdentifier = %TARGETBUNDLE%
     if __peekUsesUITesting {
         __peekPrepareUITesting()
         __peekStartAccessibility()
+        __PeekBackgroundKeeper.shared.start()
     } else {
         __peekWithoutTestDaemon()
     }
@@ -908,6 +911,7 @@ let __peekTargetBundleIdentifier = %TARGETBUNDLE%
         suite.addTest(XCTestSuite(forTestCaseClass: testClass))
     }
     suite.run()
+    if __peekUsesUITesting { __PeekBackgroundKeeper.shared.stop() }
     return suite.testRun?.hasSucceeded ?? false
 }
 
@@ -953,7 +957,13 @@ let __peekTargetBundleIdentifier = %TARGETBUNDLE%
     // ~30 s timeout. Let the app's run loop turn for a moment instead.
     let settle: @convention(block) (AnyObject) -> Void = { _ in RunLoop.current.run(until: Date().addingTimeInterval(0.3)) }
     let settleWithFlag: @convention(block) (AnyObject, Bool) -> Void = { _, _ in RunLoop.current.run(until: Date().addingTimeInterval(0.3)) }
-    for (className, name, block) in [("XCUIApplication", "_waitForQuiescence", settle as Any),
+    // Activating or launching an app waits the same way (60 s for an idle notification only an
+    // injected agent sends). Give the app a second to draw instead.
+    let settleApp: @convention(block) (AnyObject, Bool, Bool) -> Void = { _, _, _ in RunLoop.current.run(until: Date().addingTimeInterval(1)) }
+    let settleAppActivity: @convention(block) (AnyObject, Bool, AnyObject?, Bool) -> Void = { _, _, _, _ in RunLoop.current.run(until: Date().addingTimeInterval(1)) }
+    for (className, name, block) in [("XCUIApplicationProcess", "waitForQuiescenceIncludingAnimationsIdle:isPreEvent:", settleApp as Any),
+                                     ("XCUIApplicationProcess", "waitForQuiescenceIncludingAnimationsIdle:usingActivity:isPreEvent:", settleAppActivity),
+                                     ("XCUIApplication", "_waitForQuiescence", settle),
                                      ("XCUIApplication", "_waitForQuiescenceAsPreEvent:", settleWithFlag),
                                      ("XCAXClient_iOS", "waitForQuiescenceOnAllForegroundApplicationsAsPreEvent:", settleWithFlag)] {
         if let target = NSClassFromString(className), let method = class_getInstanceMethod(target, NSSelectorFromString(name)) {
@@ -1040,6 +1050,75 @@ func __peekApplyLaunchOptions(_ app: AnyObject) {
         }
     }
     UserDefaults.standard.setVolatileDomain(defaults, forName: UserDefaults.argumentDomain)
+}
+
+/// UI tests may open other apps, which sends Peek (and the tests running in it) to the
+/// background, where iOS suspends it within seconds. Keep it running with whatever the app
+/// hosting Peek allows: a background task (about 30 s), silent audio or location updates
+/// (for as long as needed, if its Info.plist has those background modes).
+@MainActor final class __PeekBackgroundKeeper: NSObject, CLLocationManagerDelegate {
+    static let shared = __PeekBackgroundKeeper()
+    private var task = UIBackgroundTaskIdentifier.invalid
+    private var player: AVAudioPlayer?
+    private var location: CLLocationManager?
+
+    func start() {
+        let host = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
+        let info = NSDictionary(contentsOf: host.appendingPathComponent("Info.plist"))
+        let modes = (info?["UIBackgroundModes"] as? [String]) ?? []
+        var kept = ["background task"]
+        task = UIApplication.shared.beginBackgroundTask(withName: "peek tests") { [weak self] in self?.endTask() }
+        if modes.contains("audio"), startSilentAudio() { kept.append("silent audio") }
+        // CoreLocation checks the main bundle (Peek's, under LiveContainer) for the mode too.
+        let ownModes = (Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String]) ?? []
+        if modes.contains("location"), ownModes.contains("location"),
+           [.authorizedAlways, .authorizedWhenInUse].contains(CLLocationManager().authorizationStatus) {
+            let manager = CLLocationManager()
+            manager.delegate = self
+            manager.allowsBackgroundLocationUpdates = true
+            manager.pausesLocationUpdatesAutomatically = false
+            manager.desiredAccuracy = kCLLocationAccuracyThreeKilometers
+            manager.startUpdatingLocation()
+            location = manager
+            kept.append("location updates")
+        }
+        print("peek: kept alive in the background by \(kept.joined(separator: ", ")) (host background modes: \(modes))")
+    }
+
+    func stop() {
+        player?.stop(); player = nil
+        location?.stopUpdatingLocation(); location = nil
+        endTask()
+    }
+
+    private func endTask() {
+        if task != .invalid { UIApplication.shared.endBackgroundTask(task); task = .invalid }
+    }
+
+    private func startSilentAudio() -> Bool {
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, options: [.mixWithOthers])
+            try AVAudioSession.sharedInstance().setActive(true)
+            // One second of silence as a WAV file, looped.
+            var wav = Data()
+            func append<T>(_ value: T) { withUnsafeBytes(of: value) { wav.append(contentsOf: $0) } }
+            let samples = 8000
+            wav.append(contentsOf: Array("RIFF".utf8)); append(UInt32(36 + samples * 2).littleEndian)
+            wav.append(contentsOf: Array("WAVEfmt ".utf8)); append(UInt32(16).littleEndian); append(UInt16(1).littleEndian)
+            append(UInt16(1).littleEndian); append(UInt32(8000).littleEndian); append(UInt32(16000).littleEndian)
+            append(UInt16(2).littleEndian); append(UInt16(16).littleEndian)
+            wav.append(contentsOf: Array("data".utf8)); append(UInt32(samples * 2).littleEndian)
+            wav.append(Data(count: samples * 2))
+            let player = try AVAudioPlayer(data: wav)
+            player.numberOfLoops = -1
+            player.volume = 0
+            guard player.play() else { return false }
+            self.player = player
+            return true
+        } catch {
+            return false
+        }
+    }
 }
 
 /// XCUITest reads an app through its accessibility server, which apps start only when launched
