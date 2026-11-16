@@ -627,7 +627,7 @@ public func __peekEntry(_ index: Int32) -> UnsafeMutableRawPointer? {
             __peekPreviousExceptionHandler?(exception)
         }
     }
-    let controller: UIViewController? = MainActor.assumeIsolated {
+%PREPARE%    let controller: UIViewController? = MainActor.assumeIsolated {
         switch index {
 %CASES%
         default: return nil
@@ -645,6 +645,18 @@ import Combine
 import DeveloperToolsSupport
 import SwiftUI
 import UIKit
+
+/// The implementation a method had before any peek build replaced it. Each build is a module of
+/// its own and replaces the same methods again (the process keeps them): taking the current
+/// implementation as "the original" would chain every earlier build's replacement, and its
+/// stale state, into this one. The first original is kept under a second selector.
+func __peekOriginal(_ cls: AnyClass, _ name: String) -> IMP? {
+    let saved = NSSelectorFromString("__peekOriginal_" + name)
+    if let kept = class_getInstanceMethod(cls, saved) { return method_getImplementation(kept) }
+    guard let method = class_getInstanceMethod(cls, NSSelectorFromString(name)) else { return nil }
+    class_addMethod(cls, saved, method_getImplementation(method), method_getTypeEncoding(method))
+    return method_getImplementation(method)
+}
 
 // A #Preview body may produce a SwiftUI view, a view controller or a UIKit view.
 func __peekPreview<V: SwiftUI.View>(@SwiftUI.ViewBuilder _ make: () -> V) -> SwiftUI.AnyView {
@@ -1192,18 +1204,6 @@ func __peekIsTarget(_ app: AnyObject) -> Bool {
     }
 }
 
-/// The implementation a method had before any peek build replaced it. Each build is a module of
-/// its own and replaces the same methods again (the process keeps them): taking the current
-/// implementation as "the original" would chain every earlier build's replacement, and its
-/// stale state, into this one. The first original is kept under a second selector.
-func __peekOriginal(_ cls: AnyClass, _ name: String) -> IMP? {
-    let saved = NSSelectorFromString("__peekOriginal_" + name)
-    if let kept = class_getInstanceMethod(cls, saved) { return method_getImplementation(kept) }
-    guard let method = class_getInstanceMethod(cls, NSSelectorFromString(name)) else { return nil }
-    class_addMethod(cls, saved, method_getImplementation(method), method_getTypeEncoding(method))
-    return method_getImplementation(method)
-}
-
 /// The original XCUIApplication.activate().
 nonisolated(unsafe) var __peekActivate: (AnyObject) -> Void = { _ in }
 
@@ -1418,6 +1418,21 @@ extension Foundation.Bundle {
         return Bundle(path: folder + "/%NAME%.bundle") ?? .main
     }()
 }
+
+// An app finds its strings in its main bundle (Text("key") looks there), which under peek is
+// Peek's: what the main bundle lacks is looked up in the app's own bundle instead.
+let __peekLocalizeFromModule: Void = {
+    guard let original = __peekOriginal(Bundle.self, "localizedStringForKey:value:table:"),
+          let method = class_getInstanceMethod(Bundle.self, #selector(Bundle.localizedString(forKey:value:table:))) else { return }
+    typealias Lookup = @convention(c) (Bundle, Selector, NSString, NSString?, NSString?) -> NSString
+    let selector = #selector(Bundle.localizedString(forKey:value:table:))
+    let lookup: @convention(block) (Bundle, NSString, NSString?, NSString?) -> NSString = { bundle, key, value, table in
+        let found = unsafeBitCast(original, to: Lookup.self)(bundle, selector, key, value, table)
+        guard bundle === Bundle.main, found == key || (value != nil && found == value!), Bundle.module !== Bundle.main else { return found }
+        return unsafeBitCast(original, to: Lookup.self)(Bundle.module, selector, key, value, table)
+    }
+    method_setImplementation(method, imp_implementationWithBlock(lookup))
+}()
 
 // SwiftUI's Image(_:bundle:) only looks in compiled asset catalogs (Assets.car); peek ships loose
 // image files instead, which UIImage(named:in:with:) finds.
@@ -2458,7 +2473,8 @@ class Builder:
                                                     .replace("%TARGETBUNDLE%", swift_string(self.target_bundle_identifier()))
                                                     if self.uses_xctest else XCTEST_NONE)
                             if self.tests else ""))
-        write_if_changed(entry, ENTRY_TEMPLATE.replace("%CASES%", body))
+        write_if_changed(entry, ENTRY_TEMPLATE.replace("%CASES%", body)
+                         .replace("%PREPARE%", "    _ = __peekLocalizeFromModule\n" if bundle_name else ""))
         files = [c for c, _ in inputs] + [support, entry]
         for stale in srcdir.glob("*.swift"):
             if stale not in files:
