@@ -2304,7 +2304,10 @@ class Builder:
         if not objects:
             return None
         frameworks = self.package.frameworks()
-        key = hashlib.sha1(repr((self._stamp(objects), self._stamp(frameworks), sign_key, self.ios)).encode()).hexdigest()[:12]
+        # Test builds link Testing and XCTest into it too, which a preview of the same project
+        # must not inherit (the phone only has them while tests run).
+        linked = (self.tests, self.uses_xctest)
+        key = hashlib.sha1(repr((self._stamp(objects), self._stamp(frameworks), sign_key, self.ios, linked)).encode()).hexdigest()[:12]
         folder = self.out / "deps"
         path = folder / f"PeekDeps-{key}.dylib"
         if not path.exists():
