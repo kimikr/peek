@@ -614,6 +614,12 @@ import UIKit
 
 @_cdecl("peek_entry")
 public func __peekEntry(_ index: Int32) -> UnsafeMutableRawPointer? {
+    // An uncaught Objective-C exception otherwise leaves only raw addresses in the output.
+    if NSGetUncaughtExceptionHandler() == nil {
+        NSSetUncaughtExceptionHandler { exception in
+            print("*** \\(exception.name.rawValue): \\(exception.reason ?? "")\\n" + exception.callStackSymbols.joined(separator: "\\n"))
+        }
+    }
     let controller: UIViewController? = MainActor.assumeIsolated {
         switch index {
 %CASES%
