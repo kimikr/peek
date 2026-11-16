@@ -1015,7 +1015,20 @@ final class __PeekFailureObserver: NSObject, XCTestObservation {
         typealias Call = @convention(c) (AnyObject, Selector) -> Void
         typealias State = @convention(c) (AnyObject, Selector) -> UInt
         let activate = class_getInstanceMethod(application, NSSelectorFromString("activate")).map(method_getImplementation)
-        __peekActivate = { app in activate.map { unsafeBitCast($0, to: Call.self)(app, NSSelectorFromString("activate")) } }
+        let stateOf = class_getInstanceMethod(application, NSSelectorFromString("state")).map(method_getImplementation)
+        __peekActivate = { app in
+            // An app testmanagerd launches never loads its accessibility server; one opened the
+            // usual way (as from the Home Screen) does. So a quit app is opened first.
+            let state = { stateOf.map { unsafeBitCast($0, to: State.self)(app, NSSelectorFromString("state")) } ?? 4 }
+            if !__peekIsTarget(app), state() <= 1, let bundle = app.value(forKey: "bundleID") as? String,
+               let workspace = (NSClassFromString("LSApplicationWorkspace") as AnyObject?)?.perform(NSSelectorFromString("defaultWorkspace"))?.takeUnretainedValue() {
+                _ = workspace.perform(NSSelectorFromString("openApplicationWithBundleID:"), with: bundle)
+                let deadline = Date().addingTimeInterval(10)
+                while state() <= 1, Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.1)) }
+                RunLoop.current.run(until: Date().addingTimeInterval(1))  // its first screen
+            }
+            activate.map { unsafeBitCast($0, to: Call.self)(app, NSSelectorFromString("activate")) }
+        }
         replace("launch") { _ -> @convention(block) (AnyObject) -> Void in { app in
             // Another app launched by testmanagerd never loads its accessibility server (the test
             // then waits 60 s and fails), so it is brought to the front instead, as activate() does.
@@ -1024,6 +1037,7 @@ final class __PeekFailureObserver: NSObject, XCTestObservation {
         } }
         replace("activate") { original -> @convention(block) (AnyObject) -> Void in { app in
             if __peekIsTarget(app), __peekTerminated { return __peekRelaunch(app) }  // activate() launches a quit app
+            if !__peekIsTarget(app) { return __peekActivate(app) }
             unsafeBitCast(original, to: Call.self)(app, NSSelectorFromString("activate"))
         } }
         replace("terminate") { original -> @convention(block) (AnyObject) -> Void in { app in
