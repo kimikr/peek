@@ -20,4 +20,22 @@ final class TallyUITests: XCTestCase {
         field.typeText("Peek")
         XCTAssertEqual(app.staticTexts["greeting"].label, "Hello, Peek!")
     }
+
+    @MainActor func testGestures() throws {
+        let app = XCUIApplication()
+        app.launch()
+        let toggle = app.switches["notify"]
+        toggle.switches.firstMatch.tap()
+        XCTAssertEqual(toggle.value as? String, "1")
+        app.sliders["level"].adjust(toNormalizedSliderPosition: 0.9)
+        XCTAssertNotEqual(app.staticTexts["levelText"].label, "Level 50")
+        app.buttons["Add"].press(forDuration: 1)
+        let last = app.staticTexts["Row 30"]
+        var swipes = 0
+        while !last.isHittable && swipes < 8 {
+            app.swipeUp()
+            swipes += 1
+        }
+        XCTAssertTrue(last.isHittable, "Row 30 not reached after \(swipes) swipes")
+    }
 }

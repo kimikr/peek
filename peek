@@ -840,6 +840,13 @@ struct __PeekTestRunner: SwiftUI.View {
     }
 
     private func run() async {
+            // A newer build can arrive while tests still run; each build is a module of its own,
+            // so the process environment is the one place they all see. Wait for the earlier run.
+            while getenv("PEEK_TESTS_RUNNING") != nil {
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+            setenv("PEEK_TESTS_RUNNING", "1", 1)
+            defer { unsetenv("PEEK_TESTS_RUNNING") }
             started = Date()
             let module = String(reflecting: __PeekTestRunner.self).split(separator: ".")[0]
             // Started from a run loop callback, not from this main-queue job: while XCTest waits
@@ -951,6 +958,14 @@ let __peekTargetBundleIdentifier = %TARGETBUNDLE%
         if let target = NSClassFromString(className), let method = class_getInstanceMethod(target, NSSelectorFromString(name)) {
             method_setImplementation(method, imp_implementationWithBlock(block))
         }
+    }
+    // testmanagerd confirms an event once the target app reports it handled, through an agent
+    // Xcode injects into the app. Peek has no such agent, so testmanagerd falls back to an
+    // "implicit confirmation" delay (5 s by default). The runner chooses that delay.
+    if let session = NSClassFromString("XCTRunnerDaemonSession"),
+       let method = class_getInstanceMethod(session, NSSelectorFromString("implicitEventConfirmationIntervalForCurrentContext")) {
+        let interval: @convention(block) (AnyObject) -> Double = { _ in 0.2 }
+        method_setImplementation(method, imp_implementationWithBlock(interval))
     }
     typealias IsEnabled = @convention(c) () -> Bool
     let handle = dlopen("/System/Library/PrivateFrameworks/AutomationMode.framework/AutomationMode", RTLD_NOW)
