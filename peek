@@ -612,12 +612,19 @@ ENTRY_TEMPLATE = """\
 import SwiftUI
 import UIKit
 
+nonisolated(unsafe) var __peekPreviousExceptionHandler: (@convention(c) (NSException) -> Void)?
+
 @_cdecl("peek_entry")
 public func __peekEntry(_ index: Int32) -> UnsafeMutableRawPointer? {
-    // An uncaught Objective-C exception otherwise leaves only raw addresses in the output.
-    if NSGetUncaughtExceptionHandler() == nil {
+    // An uncaught Objective-C exception otherwise leaves only raw addresses in the output. The
+    // app hosting Peek (LiveContainer) may have a handler already: print, then hand over to it.
+    if getenv("PEEK_EXCEPTION_HANDLER") == nil {
+        setenv("PEEK_EXCEPTION_HANDLER", "1", 1)
+        __peekPreviousExceptionHandler = NSGetUncaughtExceptionHandler()
         NSSetUncaughtExceptionHandler { exception in
             print("*** \\(exception.name.rawValue): \\(exception.reason ?? "")\\n" + exception.callStackSymbols.joined(separator: "\\n"))
+            fflush(stdout)
+            __peekPreviousExceptionHandler?(exception)
         }
     }
     let controller: UIViewController? = MainActor.assumeIsolated {
