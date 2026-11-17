@@ -1422,16 +1422,35 @@ extension Foundation.Bundle {
 // An app finds its strings in its main bundle (Text("key") looks there), which under peek is
 // Peek's: what the main bundle lacks is looked up in the app's own bundle instead.
 let __peekLocalizeFromModule: Void = {
-    guard let original = __peekOriginal(Bundle.self, "localizedStringForKey:value:table:"),
-          let method = class_getInstanceMethod(Bundle.self, #selector(Bundle.localizedString(forKey:value:table:))) else { return }
-    typealias Lookup = @convention(c) (Bundle, Selector, NSString, NSString?, NSString?) -> NSString
-    let selector = #selector(Bundle.localizedString(forKey:value:table:))
-    let lookup: @convention(block) (Bundle, NSString, NSString?, NSString?) -> NSString = { bundle, key, value, table in
-        let found = unsafeBitCast(original, to: Lookup.self)(bundle, selector, key, value, table)
-        guard bundle === Bundle.main, found == key || (value != nil && found == value!), Bundle.module !== Bundle.main else { return found }
-        return unsafeBitCast(original, to: Lookup.self)(Bundle.module, selector, key, value, table)
+    let module = Bundle.module
+    print("peek: strings missing from the main bundle come from \\(module === Bundle.main ? "nowhere (no app bundle)" : module.bundlePath)")
+    guard module !== Bundle.main else { return }
+    func missing(_ found: NSString, _ key: NSString, _ value: NSString?) -> Bool {
+        found == key || (value.map { found == $0 } ?? false)
     }
-    method_setImplementation(method, imp_implementationWithBlock(lookup))
+    // Text("key") and String(localized:) reach the bundle through either of these.
+    if let original = __peekOriginal(Bundle.self, "localizedStringForKey:value:table:"),
+       let method = class_getInstanceMethod(Bundle.self, NSSelectorFromString("localizedStringForKey:value:table:")) {
+        typealias Lookup = @convention(c) (Bundle, Selector, NSString, NSString?, NSString?) -> NSString
+        let selector = NSSelectorFromString("localizedStringForKey:value:table:")
+        let lookup: @convention(block) (Bundle, NSString, NSString?, NSString?) -> NSString = { bundle, key, value, table in
+            let found = unsafeBitCast(original, to: Lookup.self)(bundle, selector, key, value, table)
+            guard bundle === Bundle.main, missing(found, key, value) else { return found }
+            return unsafeBitCast(original, to: Lookup.self)(module, selector, key, value, table)
+        }
+        method_setImplementation(method, imp_implementationWithBlock(lookup))
+    }
+    if let original = __peekOriginal(Bundle.self, "localizedStringForKey:value:table:localizations:"),
+       let method = class_getInstanceMethod(Bundle.self, NSSelectorFromString("localizedStringForKey:value:table:localizations:")) {
+        typealias Lookup = @convention(c) (Bundle, Selector, NSString, NSString?, NSString?, NSArray?) -> NSString
+        let selector = NSSelectorFromString("localizedStringForKey:value:table:localizations:")
+        let lookup: @convention(block) (Bundle, NSString, NSString?, NSString?, NSArray?) -> NSString = { bundle, key, value, table, languages in
+            let found = unsafeBitCast(original, to: Lookup.self)(bundle, selector, key, value, table, languages)
+            guard bundle === Bundle.main, missing(found, key, value) else { return found }
+            return unsafeBitCast(original, to: Lookup.self)(module, selector, key, value, table, languages)
+        }
+        method_setImplementation(method, imp_implementationWithBlock(lookup))
+    }
 }()
 
 // SwiftUI's Image(_:bundle:) only looks in compiled asset catalogs (Assets.car); peek ships loose
