@@ -184,7 +184,7 @@ class Hardening(unittest.TestCase):
         finally:
             peek.subprocess.run = real
         self.assertEqual(package.language_mode, "6")
-        self.assertEqual(package.swift_flags, ["-D", "FLAG"])
+        self.assertEqual(package.swift_flags, ["-D", "SWIFT_PACKAGE", "-D", "FLAG"])
         self.assertEqual(package.link_flags, ["-Xlinker", "-x"])
 
 

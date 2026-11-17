@@ -1425,8 +1425,10 @@ let __peekLocalizeFromModule: Void = {
     let module = Bundle.module
     print("peek: strings missing from the main bundle come from \\(module === Bundle.main ? "nowhere (no app bundle)" : module.bundlePath)")
     guard module !== Bundle.main else { return }
-    func missing(_ found: NSString, _ key: NSString, _ value: NSString?) -> Bool {
-        found == key || (value.map { found == $0 } ?? false)
+    nonisolated(unsafe) var seen = Set<String>()
+    func missing(_ found: NSString, _ key: NSString, _ value: NSString?, _ via: String) -> Bool {
+        if seen.insert(via).inserted { print("peek: the app looks up strings with \\(via)") }
+        return found == key || (value.map { found == $0 } ?? false)
     }
     // Text("key") and String(localized:) reach the bundle through either of these.
     if let original = __peekOriginal(Bundle.self, "localizedStringForKey:value:table:"),
@@ -1435,7 +1437,7 @@ let __peekLocalizeFromModule: Void = {
         let selector = NSSelectorFromString("localizedStringForKey:value:table:")
         let lookup: @convention(block) (Bundle, NSString, NSString?, NSString?) -> NSString = { bundle, key, value, table in
             let found = unsafeBitCast(original, to: Lookup.self)(bundle, selector, key, value, table)
-            guard bundle === Bundle.main, missing(found, key, value) else { return found }
+            guard bundle === Bundle.main, missing(found, key, value, "localizedString(forKey:value:table:)") else { return found }
             return unsafeBitCast(original, to: Lookup.self)(module, selector, key, value, table)
         }
         method_setImplementation(method, imp_implementationWithBlock(lookup))
@@ -1446,8 +1448,20 @@ let __peekLocalizeFromModule: Void = {
         let selector = NSSelectorFromString("localizedStringForKey:value:table:localizations:")
         let lookup: @convention(block) (Bundle, NSString, NSString?, NSString?, NSArray?) -> NSString = { bundle, key, value, table, languages in
             let found = unsafeBitCast(original, to: Lookup.self)(bundle, selector, key, value, table, languages)
-            guard bundle === Bundle.main, missing(found, key, value) else { return found }
+            guard bundle === Bundle.main, missing(found, key, value, "localizedString(forKey:value:table:localizations:)") else { return found }
             return unsafeBitCast(original, to: Lookup.self)(module, selector, key, value, table, languages)
+        }
+        method_setImplementation(method, imp_implementationWithBlock(lookup))
+    }
+    // Text("key") on iOS 15 and later goes through the attributed lookup (keys may hold Markdown).
+    if let original = __peekOriginal(Bundle.self, "localizedAttributedStringForKey:value:table:"),
+       let method = class_getInstanceMethod(Bundle.self, NSSelectorFromString("localizedAttributedStringForKey:value:table:")) {
+        typealias Lookup = @convention(c) (Bundle, Selector, NSString, NSString?, NSString?) -> NSAttributedString
+        let selector = NSSelectorFromString("localizedAttributedStringForKey:value:table:")
+        let lookup: @convention(block) (Bundle, NSString, NSString?, NSString?) -> NSAttributedString = { bundle, key, value, table in
+            let found = unsafeBitCast(original, to: Lookup.self)(bundle, selector, key, value, table)
+            guard bundle === Bundle.main, missing(found.string as NSString, key, value, "localizedAttributedString(forKey:value:table:)") else { return found }
+            return unsafeBitCast(original, to: Lookup.self)(module, selector, key, value, table)
         }
         method_setImplementation(method, imp_implementationWithBlock(lookup))
     }
@@ -1581,7 +1595,8 @@ class Package:
 
     def settings(self, swift, wanted):
         """Build settings of the previewed target from Package.swift: language mode and swiftSettings."""
-        self.language_mode, self.swift_flags, self.link_flags = None, [], []
+        # SwiftPM defines SWIFT_PACKAGE in every package target (SwiftGen picks Bundle.module by it).
+        self.language_mode, self.swift_flags, self.link_flags = None, ["-D", "SWIFT_PACKAGE"], []
         self.default_localization = None
         proc = subprocess.run([str(swift) if swift.exists() else "swift", "package", "dump-package"],
                               cwd=self.root, capture_output=True, text=True, env=self.tc.swift_env())
