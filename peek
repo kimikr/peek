@@ -107,7 +107,7 @@ class Toolchain:
         swift = Path(self.swiftc).with_name("swift")
         cmd = [str(swift) if swift.exists() else "swift", "build", "--configuration", "debug",
                "--build-system", "swiftbuild", "--triple", "arm64-apple-ios", "--scratch-path", str(scratch),
-               *extra]
+               *extra, *(a for f in self.apple_macros(package_dir) for a in ("-Xswiftc", f))]
         for name in ("toolset-swb.json", "toolset.json"):
             if (self.bundle / name).exists():
                 cmd += ["--toolset", str(self.bundle / name)]
@@ -119,6 +119,37 @@ class Toolchain:
         env["XCODE_EXTRA_PLATFORM_FOLDERS"] = str(self.bundle / "Developer/Platforms")
         env["PATH"] = f"{self.bundle / 'toolset/bin'}:{Path(self.swiftc).parent}:{env.get('PATH', '')}"
         return env
+
+    def apple_macros(self, sources):
+        """-load-plugin-executable flags for peek's own SwiftData and Foundation macros (macros/).
+
+        Xcode has these only as macOS binaries, and the Linux toolchain's #Predicate expands to
+        FoundationEssentials, which iOS lacks. Built on first use by code that needs them."""
+        if getattr(self, "_apple_macros", None) is not None:
+            return self._apple_macros
+        source = Path(__file__).resolve().parent / "macros"
+        scratch = Path.home() / ".peek/macros"
+        names = ("SwiftDataMacros", "FoundationMacros")
+        exes = [scratch / "debug" / n for n in names]
+        newest = max((f.stat().st_mtime for f in source.rglob("*.swift")), default=0)
+        if not all(e.exists() and e.stat().st_mtime >= newest for e in exes):
+            pattern = re.compile(r"\bimport\s+SwiftData\b|#(Predicate|Expression|bundle)\b")
+            def files():
+                for folder, dirs, names in os.walk(sources, followlinks=True):
+                    dirs[:] = [d for d in dirs if not d.startswith(".")]  # .build, .git
+                    yield from (Path(folder) / n for n in names if n.endswith(".swift"))
+            if not any(pattern.search(f.read_text(errors="ignore")) for f in files()):
+                return []
+            log("building the SwiftData and #Predicate macros (once; takes a few minutes)", "dim")
+            swift = Path(self.swiftc).with_name("swift")
+            proc = subprocess.run([str(swift) if swift.exists() else "swift", "build", "--package-path", str(source),
+                                   "--scratch-path", str(scratch)], capture_output=True, text=True)
+            if proc.returncode != 0 or not all(e.exists() for e in exes):
+                log("peek: the SwiftData macros could not be built:\n" + (proc.stdout + proc.stderr)[-2000:], "red")
+                self._apple_macros = []
+                return []
+        self._apple_macros = [a for n, e in zip(names, exes) for a in ("-load-plugin-executable", f"{e}#{n}")]
+        return self._apple_macros
 
     @staticmethod
     def _find(name, extra):
@@ -2353,7 +2384,8 @@ class Builder:
         return found
 
     def _common_flags(self):
-        cmd = ["-target", f"arm64-apple-ios{self.ios}", "-sdk", str(self.tc.sdk), "-resource-dir", str(self.tc.resources)]
+        cmd = ["-target", f"arm64-apple-ios{self.ios}", "-sdk", str(self.tc.sdk), "-resource-dir", str(self.tc.resources),
+               *self.tc.apple_macros(self.root)]
         if self.package:
             products = self.package.products
             cmd += ["-I", str(products), "-F", str(products / "PackageFrameworks"), "-F", str(products)]
