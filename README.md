@@ -187,7 +187,9 @@ String catalogs (`.xcstrings`) become `.strings` and `.stringsdict` files
 expands to a module iOS does not have. peek has its own implementation of both
 in `macros/`, built once (a few minutes, needs network for swift-syntax) the
 first time code that imports SwiftData or uses `#Predicate` is compiled. Models
-are saved on the phone like in your app. See `examples/Notes`.
+are saved on the phone like in your app, in a store of each previewed project's
+own (`Application Support/Peek/<folder name>/default.store`), so one project's
+models never touch another's. See `examples/Notes`.
 
 See `examples/Weather` for a package with a dependency and a resource, and
 `examples/Calculator` for one with Swift Testing tests (`peek test`).
@@ -327,10 +329,6 @@ in the link is used. Pair with `peek link --qr` at any time.
 - **The preview lives in the Peek app's sandbox.** `UserDefaults`, the
   keychain and files are Peek's, so nothing your installed app has saved
   (settings, logins, caches) is there.
-- **SwiftData stores are shared.** Inside LiveContainer, `ModelContainer`'s
-  default store is in a folder all its apps share, so two previewed apps with
-  different models use the same `default.store`. Give the container a URL of
-  its own (`ModelConfiguration(url:)`) if that gets in the way.
 - **`Bundle.main` is the Peek app's bundle**, so `Image("name")` without
   `bundle: .module`, your `Info.plist` keys, URL schemes, app extensions and
   entitlements (HealthKit, push, iCloud, App Groups, …) are not your app's.

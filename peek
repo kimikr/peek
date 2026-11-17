@@ -73,6 +73,12 @@ def log(msg, color=None):
 
 # ---------------------------------------------------------------- toolchain
 
+# What a build prints when code needs peek's SwiftData or Foundation macros (see apple_macros).
+NEEDS_APPLE_MACROS = re.compile(r"plugin for module 'SwiftDataMacros' not found|"
+                                r"could not be found in executable plugin '[^']*SwiftDataMacros'|"
+                                r"cannot find 'FoundationEssentials' in scope")
+
+
 class Toolchain:
     """Locates swiftc, the Darwin Swift SDK bundle, and ldid."""
 
@@ -107,12 +113,21 @@ class Toolchain:
         swift = Path(self.swiftc).with_name("swift")
         cmd = [str(swift) if swift.exists() else "swift", "build", "--configuration", "debug",
                "--build-system", "swiftbuild", "--triple", "arm64-apple-ios", "--scratch-path", str(scratch),
-               *extra, *(a for f in self.apple_macros(package_dir) for a in ("-Xswiftc", f))]
+               *extra]
         for name in ("toolset-swb.json", "toolset.json"):
             if (self.bundle / name).exists():
                 cmd += ["--toolset", str(self.bundle / name)]
                 break
-        return subprocess.run(cmd, cwd=package_dir, capture_output=True, text=True, env=self.swift_env())
+        macros = self.apple_macros(package_dir)
+        proc = subprocess.run(cmd + [a for f in macros for a in ("-Xswiftc", f)],
+                              cwd=package_dir, capture_output=True, text=True, env=self.swift_env())
+        # A dependency (local or remote) the scan did not see may need them.
+        if not macros and NEEDS_APPLE_MACROS.search(proc.stdout + proc.stderr):
+            macros = self.apple_macros(package_dir, needed=True)
+            if macros:
+                proc = subprocess.run(cmd + [a for f in macros for a in ("-Xswiftc", f)],
+                                      cwd=package_dir, capture_output=True, text=True, env=self.swift_env())
+        return proc
 
     def swift_env(self):
         env = dict(os.environ)
@@ -120,13 +135,14 @@ class Toolchain:
         env["PATH"] = f"{self.bundle / 'toolset/bin'}:{Path(self.swiftc).parent}:{env.get('PATH', '')}"
         return env
 
-    def apple_macros(self, sources):
+    def apple_macros(self, sources, needed=False):
         """-load-plugin-executable flags for peek's own SwiftData and Foundation macros (macros/).
 
         Xcode has these only as macOS binaries, and the Linux toolchain's #Predicate expands to
         FoundationEssentials, which iOS lacks. Built on first use by code that needs them."""
-        if getattr(self, "_apple_macros", None) is not None:
-            return self._apple_macros
+        cached = getattr(self, "_apple_macros", None)
+        if cached or (cached is not None and not needed):
+            return cached
         source = Path(__file__).resolve().parent / "macros"
         scratch = Path.home() / ".peek/macros"
         names = ("SwiftDataMacros", "FoundationMacros")
@@ -135,10 +151,11 @@ class Toolchain:
         if not all(e.exists() and e.stat().st_mtime >= newest for e in exes):
             pattern = re.compile(r"\bimport\s+SwiftData\b|#(Predicate|Expression|bundle)\b")
             def files():
-                for folder, dirs, names in os.walk(sources, followlinks=True):
+                for folder, dirs, found in os.walk(sources, followlinks=True):
                     dirs[:] = [d for d in dirs if not d.startswith(".")]  # .build, .git
-                    yield from (Path(folder) / n for n in names if n.endswith(".swift"))
-            if not any(pattern.search(f.read_text(errors="ignore")) for f in files()):
+                    yield from (Path(folder) / f for f in found if f.endswith(".swift"))
+            if not needed and not any(pattern.search(f.read_text(errors="ignore")) for f in files()):
+                self._apple_macros = []
                 return []
             log("building the SwiftData and #Predicate macros (once; takes a few minutes)", "dim")
             swift = Path(self.swiftc).with_name("swift")
@@ -687,6 +704,37 @@ func __peekOriginal(_ cls: AnyClass, _ name: String) -> IMP? {
     guard let method = class_getInstanceMethod(cls, NSSelectorFromString(name)) else { return nil }
     class_addMethod(cls, saved, method_getImplementation(method), method_getTypeEncoding(method))
     return method_getImplementation(method)
+}
+
+// SwiftData's default store (Application Support/default.store) is in a folder every app run by
+// Peek shares (LiveContainer's app group): each previewed app gets a folder of its own there, or
+// opening one app's models would drop another's tables. Stores at a URL the app chose stay put.
+func __peekStoreFolder(_ app: String) {
+    guard let cls = NSClassFromString("NSPersistentStoreDescription") else { return }  // no Core Data
+    func moved(_ url: NSURL?) -> NSURL? {
+        guard let url = url as URL?, url.isFileURL, url.lastPathComponent == "default.store",
+              url.deletingLastPathComponent().lastPathComponent == "Application Support" else { return url as NSURL? }
+        let folder = url.deletingLastPathComponent().appendingPathComponent("Peek/" + app, isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        print("peek: SwiftData's default store is Application Support/Peek/\\(app)/default.store")
+        return folder.appendingPathComponent(url.lastPathComponent) as NSURL
+    }
+    if let original = __peekOriginal(cls, "initWithURL:"),
+       let method = class_getInstanceMethod(cls, NSSelectorFromString("initWithURL:")) {
+        typealias Init = @convention(c) (AnyObject, Selector, NSURL?) -> AnyObject
+        let initialize: @convention(block) (AnyObject, NSURL?) -> AnyObject = { object, url in
+            unsafeBitCast(original, to: Init.self)(object, NSSelectorFromString("initWithURL:"), moved(url))
+        }
+        method_setImplementation(method, imp_implementationWithBlock(initialize))
+    }
+    if let original = __peekOriginal(cls, "setURL:"),
+       let method = class_getInstanceMethod(cls, NSSelectorFromString("setURL:")) {
+        typealias Setter = @convention(c) (AnyObject, Selector, NSURL?) -> Void
+        let set: @convention(block) (AnyObject, NSURL?) -> Void = { object, url in
+            unsafeBitCast(original, to: Setter.self)(object, NSSelectorFromString("setURL:"), moved(url))
+        }
+        method_setImplementation(method, imp_implementationWithBlock(set))
+    }
 }
 
 // A #Preview body may produce a SwiftUI view, a view controller or a UIKit view.
@@ -2540,7 +2588,8 @@ class Builder:
                                                     if self.uses_xctest else XCTEST_NONE)
                             if self.tests else ""))
         write_if_changed(entry, ENTRY_TEMPLATE.replace("%CASES%", body)
-                         .replace("%PREPARE%", "    _ = __peekLocalizeFromModule\n" if bundle_name else ""))
+                         .replace("%PREPARE%", ("    _ = __peekLocalizeFromModule\n" if bundle_name else "")
+                                  + f"    __peekStoreFolder({swift_string(self.root.name)})\n"))
         files = [c for c, _ in inputs] + [support, entry]
         for stale in srcdir.glob("*.swift"):
             if stale not in files:
