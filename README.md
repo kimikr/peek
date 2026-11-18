@@ -172,10 +172,12 @@ frameworks are signed and sent to the phone once.
 and custom fonts work: resource bundles (the previewed target's and its
 dependencies') are sent to the phone alongside the build. Outside a package,
 files in folders named `Resources` are bundled the same way. Asset catalogs
-cannot be compiled without a Mac, so peek works around it: image sets are sent
-as loose images, colour sets (light and dark) become generated code, and
-`Image("name")`, `UIImage(named:)`, `Color("name")` and `UIColor(named:)` with
-a literal name of such an asset are pointed at them. The asset symbols Xcode
+are compiled to `Assets.car` (dark and @1x/@2x/@3x variants included) by peek's
+own `actool` in `tools/`, built on [AssetKit](https://github.com/joshuaswarren/AssetKit),
+both for the previewed target and for the dependencies SwiftPM builds. As
+`Bundle.main` is Peek's, `Image("name")`, `UIImage(named:)`, `Color("name")`
+and `UIColor(named:)` with a literal name of such an asset are pointed at the
+target's bundle, and colour sets become generated code. The asset symbols Xcode
 generates (`Color(.brand)`, `.foregroundStyle(.brand)`, `Image(.logo)`,
 `UIColor(resource:)`, `UIImage(resource:)`) are generated the same way.
 String catalogs (`.xcstrings`) become `.strings` and `.stringsdict` files
@@ -185,7 +187,7 @@ String catalogs (`.xcstrings`) become `.strings` and `.stringsdict` files
 `@Query`, `@Attribute`, `@Relationship`, `@Transient`, `#Unique`, `#Index`,
 `@ModelActor`) only as a macOS binary, and the Linux toolchain's `#Predicate`
 expands to a module iOS does not have. peek has its own implementation of both
-in `macros/`, built once (a few minutes, needs network for swift-syntax) the
+in `tools/`, built once (a few minutes, needs network for swift-syntax) the
 first time code that imports SwiftData or uses `#Predicate` is compiled. Models
 are saved on the phone like in your app, in a store of each previewed project's
 own (`Application Support/Peek/<folder name>/default.store`), so one project's
@@ -318,12 +320,11 @@ in the link is used. Pair with `peek link --qr` at any time.
   `--no-incremental` builds each version as a module of its own.
 - **Views that opt out of re-rendering** (`Equatable` views, `.equatable()`)
   show a hot-patched body only once their inputs change.
-- **Asset catalogs** are not compiled: only image sets with one image per
-  scale (no dark or size variants) and colour sets are available. A
-  dependency (not the previewed target) with an asset catalog or a string
-  catalog cannot be built, since SwiftPM needs Xcode's tools for those; nor
-  can a package with its own macro targets whose previewed target has an
-  asset catalog (macros make SwiftPM build the whole package). A
+- **Asset catalogs** hold image sets (PNG, JPEG, SVG) and colour sets; PDF
+  images, data sets and stickers are not compiled, and a target with several
+  catalogs gets its images as loose files (no dark variants). A dependency
+  (not the previewed target) with a string catalog cannot be built, since
+  SwiftPM needs Xcode's `xcstringstool` for it. A
   `DocumentGroup` that only views documents shows a placeholder, since there is
   no document to open.
 - **The preview lives in the Peek app's sandbox.** `UserDefaults`, the
@@ -395,7 +396,7 @@ in the link is used. Pair with `peek link --qr` at any time.
 
 ```sh
 python3 -m unittest discover tests     # tests (Python + openssl only)
-(cd macros && swift test)              # SwiftData macro expansions
+(cd tools && swift test)               # SwiftData macro expansions
 ./peek doctor                          # check the local setup
 ./peek build examples/Weather          # compile once, print errors
 scripts/release-ipa.sh                 # unsigned IPA for a release

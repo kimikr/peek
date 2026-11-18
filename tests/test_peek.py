@@ -17,6 +17,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import zlib
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -782,3 +783,35 @@ peek: tests failed""".splitlines()
 
 if __name__ == "__main__":
     unittest.main()
+
+
+ACTOOL = Path.home() / ".peek/macros/debug/actool"
+
+
+@unittest.skipUnless(ACTOOL.exists(), "peek's actool is not built (tools/)")
+class Actool(unittest.TestCase):
+    """peek's actool, called the way SwiftPM calls Xcode's."""
+
+    def catalog(self, folder):
+        imageset = Path(folder) / "Media.xcassets/brand-logo.imageset"
+        imageset.mkdir(parents=True)
+        def chunk(kind, data):
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        # 1x1 PNG; no "scale": Xcode's Single Scale, which must still be found as 1x
+        (imageset / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+                                            + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00")) + chunk(b"IEND", b""))
+        (imageset / "Contents.json").write_text(json.dumps({"images": [{"filename": "logo.png", "idiom": "universal"}],
+                                                        "info": {"author": "xcode", "version": 1}}))
+        return imageset.parent
+
+    def test_compiles_and_generates_symbols(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            catalog = self.catalog(tmp)
+            out, symbols = Path(tmp) / "out", Path(tmp) / "Symbols.swift"
+            subprocess.run([str(ACTOOL), str(catalog), "--compile", str(out), "--platform", "iphoneos",
+                            "--minimum-deployment-target", "17.0"], check=True, capture_output=True)
+            self.assertGreater((out / "Assets.car").stat().st_size, 0)
+            subprocess.run([str(ACTOOL), str(catalog), "--compile", str(out), "--generate-swift-asset-symbol-extensions",
+                            "NO", "--generate-swift-asset-symbols", str(symbols)], check=True, capture_output=True)
+            self.assertIn('static let `brandLogo` = DeveloperToolsSupport.ImageResource(name: "brand-logo"',
+                          symbols.read_text())

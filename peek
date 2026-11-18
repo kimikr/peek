@@ -76,7 +76,8 @@ def log(msg, color=None):
 # What a build prints when code needs peek's SwiftData or Foundation macros (see apple_macros).
 NEEDS_APPLE_MACROS = re.compile(r"plugin for module 'SwiftDataMacros' not found|"
                                 r"could not be found in executable plugin '[^']*SwiftDataMacros'|"
-                                r"cannot find 'FoundationEssentials' in scope")
+                                r"cannot find 'FoundationEssentials' in scope|"
+                                r"actool[^\n]*(is not an executable file|failed to launch)")
 
 
 class Toolchain:
@@ -131,21 +132,56 @@ class Toolchain:
 
     def swift_env(self):
         env = dict(os.environ)
-        env["XCODE_EXTRA_PLATFORM_FOLDERS"] = str(self.bundle / "Developer/Platforms")
+        env["XCODE_EXTRA_PLATFORM_FOLDERS"] = str(self.platforms())
         env["PATH"] = f"{self.bundle / 'toolset/bin'}:{Path(self.swiftc).parent}:{env.get('PATH', '')}"
         return env
 
+    def platforms(self):
+        """The SDK's platform folders, or once peek's actool is built, a copy whose iOS platform
+        points asset catalogs at it: SwiftPM only finds actool through that build setting, and
+        Xcode's is a macOS binary. The copy links to the SDK; only Info.plist is its own."""
+        sdk_platforms = self.bundle / "Developer/Platforms"
+        actool = Path.home() / ".peek/macros/debug/actool"
+        if not actool.exists():
+            return sdk_platforms
+        out = STATE_DIR / "platforms"
+        info = plistlib.loads((sdk_platforms / "iPhoneOS.platform/Info.plist").read_bytes())
+        defaults = info.setdefault("DefaultProperties", {})
+        # Relative to the platform folder in the SDK, which the copy is not in.
+        defaults["SWIFT_RESOURCE_DIR"] = str(self.bundle / "Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift")
+        ios = out / "iPhoneOS.platform"
+        ios.mkdir(parents=True, exist_ok=True)
+        defaults["ASSETCATALOG_EXEC"] = str(actool)
+        # SwiftPM keeps the Assets.car files an older actool made (same command line): drop them.
+        version, marker = str(int(actool.stat().st_mtime)), out / "actool-version"
+        if not marker.exists() or marker.read_text() != version:
+            spm = STATE_DIR / "spm"
+            for made in spm.glob("*/out/Intermediates.noindex/*/*/*/assetcatalog_output"):
+                shutil.rmtree(made, ignore_errors=True)
+            for made in spm.glob("*/out/Products/*/*.bundle/Assets.car"):
+                made.unlink()
+            marker.write_text(version)
+        write_if_changed(ios / "Info.plist", plistlib.dumps(info).decode())
+        for link, target in [(ios / "Developer", sdk_platforms / "iPhoneOS.platform/Developer")] + [
+                (out / p.name, p) for p in sdk_platforms.iterdir() if p.name != "iPhoneOS.platform"]:
+            if not link.is_symlink() or link.resolve() != target.resolve():
+                if link.is_symlink():
+                    link.unlink()
+                link.symlink_to(target)
+        return out
+
     def apple_macros(self, sources, needed=False):
-        """-load-plugin-executable flags for peek's own SwiftData and Foundation macros (macros/).
+        """-load-plugin-executable flags for peek's own SwiftData and Foundation macros (tools/),
+        which also has peek's actool (see platforms).
 
         Xcode has these only as macOS binaries, and the Linux toolchain's #Predicate expands to
         FoundationEssentials, which iOS lacks. Built on first use by code that needs them."""
         cached = getattr(self, "_apple_macros", None)
         if cached or (cached is not None and not needed):
             return cached
-        source = Path(__file__).resolve().parent / "macros"
+        source = Path(__file__).resolve().parent / "tools"
         scratch = Path.home() / ".peek/macros"
-        names = ("SwiftDataMacros", "FoundationMacros")
+        names = ("SwiftDataMacros", "FoundationMacros", "actool")
         exes = [scratch / "debug" / n for n in names]
         newest = max((f.stat().st_mtime for f in source.rglob("*.swift")), default=0)
         if not all(e.exists() and e.stat().st_mtime >= newest for e in exes):
@@ -157,17 +193,17 @@ class Toolchain:
             if not needed and not any(pattern.search(f.read_text(errors="ignore")) for f in files()):
                 self._apple_macros = []
                 return []
-            log("building the SwiftData and #Predicate macros (once; takes a few minutes)", "dim")
+            log("building peek's tools: SwiftData and #Predicate macros, actool (once; takes a few minutes)", "dim")
             swift = Path(self.swiftc).with_name("swift")
             proc = subprocess.run([str(swift) if swift.exists() else "swift", "build", "--package-path", str(source),
                                    "--scratch-path", str(scratch)], capture_output=True, text=True)
             if proc.returncode != 0 or not all(e.exists() for e in exes):
-                log("peek: the SwiftData macros could not be built:\n" + (proc.stdout + proc.stderr)[-2000:], "red")
+                log("peek: the tools in tools/ could not be built:\n" + (proc.stdout + proc.stderr)[-2000:], "red")
                 self._apple_macros = []
                 return []
             for exe in exes:  # SwiftPM leaves them alone when nothing changed: mark them current
                 os.utime(exe)
-        self._apple_macros = [a for n, e in zip(names, exes) for a in ("-load-plugin-executable", f"{e}#{n}")]
+        self._apple_macros = [a for n, e in zip(names[:2], exes) for a in ("-load-plugin-executable", f"{e}#{n}")]
         return self._apple_macros
 
     @staticmethod
@@ -2311,6 +2347,27 @@ class Builder:
         return [p for d in self.test_dirs() for p in sorted(d.rglob("*.swift"))
                 if not any(part in SKIP_DIRS - {"Tests"} or part.startswith(".") for part in p.relative_to(d).parts)]
 
+    def _compile_asset_catalog(self, catalogs):
+        """Assets.car for the target's asset catalog, made by peek's actool (tools/), or None."""
+        catalog = catalogs[0]
+        actool = Path.home() / ".peek/macros/debug/actool"
+        self.tc.apple_macros(catalog, needed=True)  # builds it the first time
+        if not actool.exists():
+            return None
+        out = self.out / "assets"
+        car = out / "Assets.car"
+        newest = max((p.stat().st_mtime for p in catalog.rglob("*")), default=0)
+        if car.exists() and car.stat().st_mtime >= newest:
+            return car
+        proc = subprocess.run([str(actool), str(catalog), "--compile", str(out),
+                               "--platform", "iphoneos", "--minimum-deployment-target", self.ios],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            log(f"{catalog.name} could not be compiled, so its images are sent one by one: "
+                + proc.stderr.strip(), "yellow")
+            return None
+        return car
+
     def resources(self):
         """Returns (bundle name for Bundle.module or None, [(path inside the archive, file)])."""
         files, name = [], None
@@ -2357,9 +2414,14 @@ class Builder:
             catalogs = sorted(base.rglob("*.xcassets"))
         else:
             catalogs = []
-        for catalog in catalogs:
-            for filename, path in flatten_asset_catalog(catalog):
-                files.append((f"{name}.bundle/{filename}", path))
+        compiled = self._compile_asset_catalog(catalogs) if len(catalogs) == 1 else None
+        if compiled:  # dark and size variants included
+            files.append((f"{name}.bundle/Assets.car", compiled))
+        else:
+            # shortcut: several catalogs in one target are flattened (one Assets.car per bundle).
+            for catalog in catalogs:
+                for filename, path in flatten_asset_catalog(catalog):
+                    files.append((f"{name}.bundle/{filename}", path))
         self.colors = asset_colors(catalogs)
         unique = {}
         for arcname, path in files:
@@ -2370,6 +2432,8 @@ class Builder:
         self.images = {re.sub(r"@\dx$", "", Path(a).stem) for a in unique
                        if name and a.startswith(f"{name}.bundle/") and a.count("/") == 1
                        and Path(a).suffix.lower() in (".png", ".jpg", ".jpeg", ".pdf", ".heic", ".gif")}
+        if compiled:
+            self.images |= {p.stem for p in catalogs[0].rglob("*.imageset")}
         return name, sorted(unique.items())
 
     def _string_catalog(self, catalog):
