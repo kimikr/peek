@@ -230,8 +230,8 @@ See `examples/Weather` for a package with a dependency and a resource, and
   goes on (or Continue without breakpoints). `// peek:log a, b` only prints.
   The screen keeps working while stopped, so place breakpoints in actions,
   tasks and functions rather than in a view's `body`. A wrong expression is a
-  compile error on that line. There is no LLDB: a debugger cannot attach to a
-  sideloaded app without a Mac. See `examples/Breakpoints`.
+  compile error on that line. peek has no LLDB (stepping, editing variables).
+  See `examples/Breakpoints`.
 - **Errors.** A compile error is shown over the last preview that worked. So
   is a build that fails to load: the previous one stays on screen.
 
