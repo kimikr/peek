@@ -865,7 +865,9 @@ func __peekAdoptAppInfo(_ xml: String) {
 func __peekDescribe<T>(_ value: T) -> String {
     var text = ""
     dump(value, to: &text, maxDepth: 4, maxItems: 50)
-    return text.trimmingCharacters(in: .newlines)
+    text = text.trimmingCharacters(in: .newlines)
+    // A plain value is one "- 3" line: just the value.
+    return !text.contains("\\n") && text.hasPrefix("- ") ? String(text.dropFirst(2)) : text
 }
 
 final class __PeekFlag: @unchecked Sendable { var on = false }
