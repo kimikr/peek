@@ -352,9 +352,13 @@ in the link is used. Pair with `peek link --qr` at any time.
   `NSSecureUnarchiveFromDataTransformer` works). Not yet known whether peek's
   build or SwiftData is at fault. `examples/SwiftDataCheck` checks the rest of
   SwiftData on the phone.
-- **`Bundle.main` is the Peek app's bundle**, so `Image("name")` without
-  `bundle: .module`, your `Info.plist` keys, URL schemes, app extensions and
-  entitlements (HealthKit, push, iCloud, App Groups, …) are not your app's.
+- **`Bundle.main` is the Peek app's bundle.** peek fills the gaps your code
+  sees: what it looks up there (strings, `url(forResource:)`, `path(forResource:)`,
+  `UIImage(named:)`) also comes from your target's bundle, and your
+  `Info.plist` keys (but not the ones about the process itself, such as the
+  bundle identifier) are added to `Bundle.main`'s. What iOS reads about the
+  app stays Peek's: URL schemes, app extensions and entitlements (HealthKit,
+  push, iCloud, App Groups, …), and permission prompts show Peek's texts.
 - **A crash in your view crashes the Peek app.** When you open it again it
   shows what the build printed last (a `fatalError` message, or the call stack
   of a crash) and loads

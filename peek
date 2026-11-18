@@ -785,6 +785,45 @@ func __peekOriginal(_ cls: AnyClass, _ name: String) -> IMP? {
 // SwiftData's default store (Application Support/default.store) is in a folder every app run by
 // Peek shares (LiveContainer's app group): each previewed app gets a folder of its own there, or
 // opening one app's models would drop another's tables. Stores at a URL the app chose stay put.
+/// Bundle.main is Peek's: the keys of the app's own Info.plist (an API key, its display name,
+/// usage descriptions) are added to what Bundle.main shows the app. Keys the system and the
+/// hosting app read about the running process stay Peek's.
+func __peekAdoptAppInfo(_ xml: String) {
+    guard let app = (try? PropertyListSerialization.propertyList(from: Data(xml.utf8), format: nil)) as? [String: Any]
+    else { return }
+    let kept: Set<String> = ["CFBundleIdentifier", "CFBundleExecutable", "CFBundlePackageType", "CFBundleInfoDictionaryVersion",
+                             "CFBundleURLTypes", "UIApplicationSceneManifest", "UILaunchScreen", "UILaunchStoryboardName",
+                             "UIMainStoryboardFile", "UIBackgroundModes", "UIRequiredDeviceCapabilities", "UIDeviceFamily",
+                             "LSRequiresIPhoneOS", "MinimumOSVersion", "NSExtension", "UIApplicationSupportsMultipleScenes"]
+    let extra = app.filter { !kept.contains($0.key) }
+    guard !extra.isEmpty else { return }
+    let main = Bundle.main
+    let byKey = NSSelectorFromString("objectForInfoDictionaryKey:")
+    if let original = __peekOriginal(Bundle.self, "objectForInfoDictionaryKey:"),
+       let method = class_getInstanceMethod(Bundle.self, byKey) {
+        typealias Get = @convention(c) (Bundle, Selector, NSString) -> AnyObject?
+        let get: @convention(block) (Bundle, NSString) -> AnyObject? = { bundle, key in
+            if bundle === main, let value = extra[key as String] { return value as AnyObject }
+            return unsafeBitCast(original, to: Get.self)(bundle, byKey, key)
+        }
+        method_setImplementation(method, imp_implementationWithBlock(get))
+    }
+    let whole = NSSelectorFromString("infoDictionary")
+    if let original = __peekOriginal(Bundle.self, "infoDictionary"),
+       let method = class_getInstanceMethod(Bundle.self, whole) {
+        typealias Get = @convention(c) (Bundle, Selector) -> NSDictionary?
+        let get: @convention(block) (Bundle) -> NSDictionary? = { bundle in
+            let info = unsafeBitCast(original, to: Get.self)(bundle, whole)
+            guard bundle === main else { return info }
+            let merged = NSMutableDictionary(dictionary: info ?? [:])
+            merged.addEntries(from: extra)
+            return merged
+        }
+        method_setImplementation(method, imp_implementationWithBlock(get))
+    }
+    print("peek: Bundle.main also shows the app's Info.plist keys \\(extra.keys.sorted().joined(separator: ", "))")
+}
+
 nonisolated(unsafe) var __peekStoreFolders = Set<String>()
 let __peekStoreLock = NSLock()  // Core Data reads URLs on any thread (a @ModelActor's, say)
 
@@ -1608,6 +1647,59 @@ extension Foundation.Bundle {
         return Bundle(path: folder + "/%NAME%.bundle") ?? .main
     }()
 }
+
+// Resources an app reads from its main bundle (Bundle.main.url(forResource:), UIImage(named:)
+// with a name made at run time) are looked up in its own bundle when Peek's has none.
+let __peekResourcesFromModule: Void = {
+    let module = Bundle.module, main = Bundle.main
+    guard module !== main else { return }
+    func replace(_ name: String, _ block: Any) {
+        guard let method = class_getInstanceMethod(Bundle.self, NSSelectorFromString(name)) else { return }
+        method_setImplementation(method, imp_implementationWithBlock(block))
+    }
+    if let original = __peekOriginal(Bundle.self, "URLForResource:withExtension:") {
+        typealias Find = @convention(c) (Bundle, Selector, NSString?, NSString?) -> NSURL?
+        let selector = NSSelectorFromString("URLForResource:withExtension:")
+        replace("URLForResource:withExtension:", { (bundle: Bundle, name: NSString?, ext: NSString?) -> NSURL? in
+            let find = unsafeBitCast(original, to: Find.self)
+            return find(bundle, selector, name, ext) ?? (bundle === main ? find(module, selector, name, ext) : nil)
+        } as @convention(block) (Bundle, NSString?, NSString?) -> NSURL?)
+    }
+    if let original = __peekOriginal(Bundle.self, "URLForResource:withExtension:subdirectory:") {
+        typealias Find = @convention(c) (Bundle, Selector, NSString?, NSString?, NSString?) -> NSURL?
+        let selector = NSSelectorFromString("URLForResource:withExtension:subdirectory:")
+        replace("URLForResource:withExtension:subdirectory:", { (bundle: Bundle, name: NSString?, ext: NSString?, dir: NSString?) -> NSURL? in
+            let find = unsafeBitCast(original, to: Find.self)
+            return find(bundle, selector, name, ext, dir) ?? (bundle === main ? find(module, selector, name, ext, dir) : nil)
+        } as @convention(block) (Bundle, NSString?, NSString?, NSString?) -> NSURL?)
+    }
+    if let original = __peekOriginal(Bundle.self, "pathForResource:ofType:") {
+        typealias Find = @convention(c) (Bundle, Selector, NSString?, NSString?) -> NSString?
+        let selector = NSSelectorFromString("pathForResource:ofType:")
+        replace("pathForResource:ofType:", { (bundle: Bundle, name: NSString?, ext: NSString?) -> NSString? in
+            let find = unsafeBitCast(original, to: Find.self)
+            return find(bundle, selector, name, ext) ?? (bundle === main ? find(module, selector, name, ext) : nil)
+        } as @convention(block) (Bundle, NSString?, NSString?) -> NSString?)
+    }
+    if let original = __peekOriginal(Bundle.self, "pathForResource:ofType:inDirectory:") {
+        typealias Find = @convention(c) (Bundle, Selector, NSString?, NSString?, NSString?) -> NSString?
+        let selector = NSSelectorFromString("pathForResource:ofType:inDirectory:")
+        replace("pathForResource:ofType:inDirectory:", { (bundle: Bundle, name: NSString?, ext: NSString?, dir: NSString?) -> NSString? in
+            let find = unsafeBitCast(original, to: Find.self)
+            return find(bundle, selector, name, ext, dir) ?? (bundle === main ? find(module, selector, name, ext, dir) : nil)
+        } as @convention(block) (Bundle, NSString?, NSString?, NSString?) -> NSString?)
+    }
+    // A class method: replaced on the metaclass.
+    let named = NSSelectorFromString("imageNamed:")
+    if let meta = object_getClass(UIImage.self), let original = __peekOriginal(meta, "imageNamed:"),
+       let method = class_getInstanceMethod(meta, named) {
+        typealias Find = @convention(c) (AnyClass, Selector, NSString) -> UIImage?
+        let find: @convention(block) (AnyClass, NSString) -> UIImage? = { cls, name in
+            unsafeBitCast(original, to: Find.self)(cls, named, name) ?? UIImage(named: name as String, in: module, with: nil)
+        }
+        method_setImplementation(method, imp_implementationWithBlock(find))
+    }
+}()
 
 // An app finds its strings in its main bundle (Text("key") looks there), which under peek is
 // Peek's: what the main bundle lacks is looked up in the app's own bundle instead. With
@@ -2630,6 +2722,30 @@ let package = Package(
     resolved = path / "project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
     if resolved.exists():  # the versions Xcode resolved
         shutil.copy(resolved, out / "Package.resolved")
+    # The Info.plist the app would have: its file plus INFOPLIST_KEY_* settings, $(VARIABLES) filled in.
+    variables = {"PRODUCT_NAME": app.get("productName", app["name"]), "EXECUTABLE_NAME": app["name"],
+                 "DEVELOPMENT_LANGUAGE": region, **{k: v for k, v in settings.items() if isinstance(v, str)}}
+
+    def expand(value):
+        if isinstance(value, str):
+            return re.sub(r"\$[({]([A-Za-z0-9_]+)(?::[^)}]*)?[)}]", lambda m: str(variables.get(m.group(1), "")), value)
+        if isinstance(value, list):
+            return [expand(v) for v in value]
+        if isinstance(value, dict):
+            return {k: expand(v) for k, v in value.items()}
+        return value
+
+    info = {}
+    if settings.get("INFOPLIST_FILE"):
+        try:
+            info = plistlib.loads((project.dir / expand(settings["INFOPLIST_FILE"])).read_bytes())
+        except (OSError, plistlib.InvalidFileException, ValueError):
+            info = {}
+    for key, value in settings.items():
+        if key.startswith("INFOPLIST_KEY_"):
+            info.setdefault(key[len("INFOPLIST_KEY_"):], value)
+    if info:
+        (out / "Info.plist").write_bytes(plistlib.dumps(expand(info)))
     (out / ".xcodeproj").write_text(str(path))
     log(f"{path.name}: target {app['name']}, built as the package in {out}", "dim")
     return out
@@ -2727,6 +2843,21 @@ class Builder:
     def test_sources(self):
         return [p for d in self.test_dirs() for p in sorted(d.rglob("*.swift"))
                 if not any(part in SKIP_DIRS - {"Tests"} or part.startswith(".") for part in p.relative_to(d).parts)]
+
+    def app_info_plist(self):
+        """The app's own Info.plist as XML, if it has one (see __peekAdoptAppInfo)."""
+        candidates = [self.root / "Info.plist"] if self.xcodeproj else []  # made by xcode_wrapper
+        if self.package:
+            candidates.append(self.package.target_dir / "Info.plist")
+        elif not self.single:
+            candidates.append(self.source_dir() / "Info.plist")
+        for path in candidates:
+            if path.is_file():
+                try:
+                    return plistlib.dumps(plistlib.loads(path.read_bytes())).decode()
+                except (plistlib.InvalidFileException, ValueError) as e:
+                    log(f"peek: {path} is not a property list ({e}); Bundle.main keeps Peek's keys", "yellow")
+        return None
 
     def _compile_asset_catalog(self, catalogs):
         """Assets.car for the target's asset catalog, made by peek's actool (tools/), or None."""
@@ -3061,9 +3192,11 @@ class Builder:
                                                     .replace("%TARGETBUNDLE%", swift_string(self.target_bundle_identifier()))
                                                     if self.uses_xctest else XCTEST_NONE)
                             if self.tests else ""))
+        info_plist = self.app_info_plist()
         write_if_changed(entry, ENTRY_TEMPLATE.replace("%CASES%", body)
                          .replace("%PREPARE%", (f"    __peekLanguageCode = {swift_string(self.language)}\n" if self.language else "")
-                                  + ("    _ = __peekLocalizeFromModule\n" if bundle_name else "")
+                                  + ("    _ = __peekLocalizeFromModule\n    _ = __peekResourcesFromModule\n" if bundle_name else "")
+                                  + (f"    __peekAdoptAppInfo({swift_string(info_plist)})\n" if info_plist else "")
                                   + f"    __peekStoreFolder({swift_string(self.name)})\n"))
         files = [c for c, _ in inputs] + [support, entry]
         for stale in srcdir.glob("*.swift"):

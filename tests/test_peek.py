@@ -7,6 +7,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import plistlib
 import re
 import shutil
 import struct
@@ -851,6 +852,8 @@ class XcodeProjects(unittest.TestCase):
             for part in ('.iOS("18.0")', '.define("FLAVOR_A")', ".defaultIsolation(MainActor.self)",
                          '.process("Sync/Assets.xcassets")', "swiftLanguageModes: [.v6]"):
                 self.assertIn(part, manifest)
+            info = plistlib.loads((out / "Info.plist").read_bytes())
+            self.assertEqual((info["PeekGreeting"], info["CFBundleDisplayName"]), ("hi", "Peek Sync"))
 
     def test_package_requirements(self):
         self.assertEqual(peek.swift_package_requirement({"kind": "upToNextMajorVersion", "minimumVersion": "2.1.1"}),

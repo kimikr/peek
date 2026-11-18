@@ -87,6 +87,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				INFOPLIST_FILE = Sync/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Peek $(PRODUCT_NAME)";
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited) FLAVOR_A";
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
