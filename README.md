@@ -224,6 +224,14 @@ See `examples/Weather` for a package with a dependency and a resource, and
   app in that language whatever the phone's is: strings come from that
   language's `.lproj` in every bundle, and SwiftUI's locale and layout
   direction follow (right to left for Arabic and Hebrew).
+- **Breakpoints.** A `// peek:break a, b.count` comment on its own line stops
+  the app there: the phone shows the values (what `dump` prints, like `po`)
+  and the call stack, the same goes to the `peek dev` output, and Continue
+  goes on (or Continue without breakpoints). `// peek:log a, b` only prints.
+  The screen keeps working while stopped, so place breakpoints in actions,
+  tasks and functions rather than in a view's `body`. A wrong expression is a
+  compile error on that line. There is no LLDB: a debugger cannot attach to a
+  sideloaded app without a Mac. See `examples/Breakpoints`.
 - **Errors.** A compile error is shown over the last preview that worked. So
   is a build that fails to load: the previous one stays on screen.
 

@@ -859,3 +859,17 @@ class XcodeProjects(unittest.TestCase):
         self.assertEqual(peek.swift_package_requirement({"kind": "upToNextMajorVersion", "minimumVersion": "2.1.1"}),
                          'from: "2.1.1"')
         self.assertEqual(peek.swift_package_requirement({"kind": "branch", "branch": "main"}), 'branch: "main"')
+
+
+class Breakpoints(unittest.TestCase):
+    def test_comments_become_calls_on_the_same_line(self):
+        src = ('func f() {\n    // peek:break x, g(a, b), "p, q"\n    let s = "// peek:break not this"\n'
+               '    /* // peek:log not this either */\n    // peek:log y\n}\n')
+        new, _, _ = peek.rewrite_source(src)
+        self.assertEqual(new.count("\n"), src.count("\n"))
+        lines = new.split("\n")
+        self.assertEqual(lines[1].strip(), '__peekBreak(true, #fileID, #line, [("x", __peekDescribe(x)), '
+                         '("g(a, b)", __peekDescribe(g(a, b))), ("\\"p, q\\"", __peekDescribe("p, q"))])')
+        self.assertEqual(lines[2], src.split("\n")[2])
+        self.assertIn("__peekBreak(false", lines[4])
+        self.assertNotIn("__peekBreak", lines[3])

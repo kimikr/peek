@@ -472,6 +472,42 @@ def active_condition(mask, pos):
     return " && ".join(parts) or None
 
 
+BREAK_RE = re.compile(r"//[ \t]*peek:(break|log)\b[ \t]*(.*)$", re.M)
+
+
+def split_expressions(text):
+    """`a, f(b, c), "x,y"` -> ["a", "f(b, c)", '"x,y"']: commas outside brackets and strings."""
+    parts, depth, start, i = [], 0, 0, 0
+    mask = code_mask(text)
+    for i, char in enumerate(mask):
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    parts.append(text[start:])
+    return [p.strip() for p in parts if p.strip()]
+
+
+def breakpoint_edits(src):
+    """`// peek:break a, b` and `// peek:log a, b` comments become calls on the same line."""
+    edits, starts, i = [], set(), 0
+    while i < len(src):  # where line comments begin (not inside strings or block comments)
+        j = skip_trivia(src, i)
+        if j != i and src.startswith("//", i):
+            starts.add(i)
+        i = j if j != i else i + 1
+    for m in BREAK_RE.finditer(src):
+        if m.start() not in starts:
+            continue
+        values = ", ".join(f"({swift_string(e)}, __peekDescribe({e}))" for e in split_expressions(m.group(2)))
+        call = f"__peekBreak({'true' if m.group(1) == 'break' else 'false'}, #fileID, #line, [{values}])"
+        edits.append((m.start(), m.end(), call))
+    return edits
+
+
 def rewrite_source(src, tag="0", keep_shape=frozenset()):
     """Makes a source file previewable without changing its line numbers.
 
@@ -484,6 +520,7 @@ def rewrite_source(src, tag="0", keep_shape=frozenset()):
     roots, app = [], None
     mask = code_mask(src)
     edits = []  # (start, end, replacement)
+    edits += breakpoint_edits(src)
     for m in MAIN_RE.finditer(mask):
         edits.append((m.start(), m.end(), " " * (m.end() - m.start())))
     for m in APP_RE.finditer(mask):
@@ -822,6 +859,85 @@ func __peekAdoptAppInfo(_ xml: String) {
         method_setImplementation(method, imp_implementationWithBlock(get))
     }
     print("peek: Bundle.main also shows the app's Info.plist keys \\(extra.keys.sorted().joined(separator: ", "))")
+}
+
+/// What `// peek:break` and `// peek:log` show for a value: what `dump` prints, as `po` would.
+func __peekDescribe<T>(_ value: T) -> String {
+    var text = ""
+    dump(value, to: &text, maxDepth: 4, maxItems: 50)
+    return text.trimmingCharacters(in: .newlines)
+}
+
+final class __PeekFlag: @unchecked Sendable { var on = false }
+let __peekBreakpointsOff = __PeekFlag()
+
+/// `// peek:break a, b` (pause: true) and `// peek:log a, b` (pause: false). A breakpoint prints
+/// the values and call stack, then holds the app at that line until Continue is tapped on the phone;
+/// the screen keeps working meanwhile (a nested run loop), so use it in actions, tasks and
+/// functions, not while SwiftUI computes a body. Returns a view so it also fits in a view builder.
+@discardableResult
+func __peekBreak(_ pause: Bool, _ file: StaticString, _ line: Int, _ values: [(String, String)]) -> SwiftUI.EmptyView {
+    var report = "peek: \\(pause ? "paused" : "log") at \\(file):\\(line)"
+    for (name, value) in values {
+        report += "\\n  \\(name) = " + value.replacingOccurrences(of: "\\n", with: "\\n    ")
+    }
+    if pause {
+        report += "\\n" + Thread.callStackSymbols.dropFirst().prefix(15).joined(separator: "\\n")
+    }
+    print(report)
+    fflush(stdout)
+    guard pause, !__peekBreakpointsOff.on else { return SwiftUI.EmptyView() }
+    if Thread.isMainThread {
+        __peekPause(report)
+    } else {
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async {
+            __peekPause(report)
+            done.signal()
+        }
+        done.wait()
+    }
+    return SwiftUI.EmptyView()
+}
+
+func __peekPause(_ report: String) {
+    MainActor.assumeIsolated {
+        guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first else { return }
+        let window = UIWindow(windowScene: scene)
+        window.windowLevel = .alert + 1
+        let controller = UIViewController()
+        controller.view.backgroundColor = UIColor.systemBackground.withAlphaComponent(0.97)
+        let text = UITextView()
+        text.isEditable = false
+        text.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        text.text = report.replacingOccurrences(of: "peek: ", with: "", options: .anchored)
+        let resumed = __PeekFlag()
+        let go = UIButton(configuration: .filled(), primaryAction: UIAction(title: "Continue") { _ in resumed.on = true })
+        let skip = UIButton(configuration: .gray(), primaryAction: UIAction(title: "Continue without breakpoints") { _ in
+            __peekBreakpointsOff.on = true
+            resumed.on = true
+        })
+        let stack = UIStackView(arrangedSubviews: [text, go, skip])
+        stack.axis = .vertical
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        controller.view.addSubview(stack)
+        let guide = controller.view.safeAreaLayoutGuide
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: guide.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: guide.trailingAnchor, constant: -16),
+            stack.topAnchor.constraint(equalTo: guide.topAnchor, constant: 16),
+            stack.bottomAnchor.constraint(equalTo: guide.bottomAnchor, constant: -16),
+        ])
+        window.rootViewController = controller
+        window.isHidden = false
+        while !resumed.on {
+            _ = RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
+        }
+        window.isHidden = true
+        print("peek: continued")
+        fflush(stdout)
+    }
 }
 
 nonisolated(unsafe) var __peekStoreFolders = Set<String>()
