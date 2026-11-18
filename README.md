@@ -220,6 +220,10 @@ See `examples/Weather` for a package with a dependency and a resource, and
 - **Display.** The menu (green dot) switches the preview between light and
   dark appearance and between text sizes, without touching the phone's
   settings.
+- **Language.** `peek dev --language de` (or `ko`, `ar`, `pt-BR`, …) shows the
+  app in that language whatever the phone's is: strings come from that
+  language's `.lproj` in every bundle, and SwiftUI's locale and layout
+  direction follow (right to left for Arabic and Hebrew).
 - **Errors.** A compile error is shown over the last preview that worked. So
   is a build that fails to load: the previous one stays on screen.
 

@@ -884,7 +884,36 @@ struct __PeekGenerationRoot<Content: SwiftUI.View>: SwiftUI.View {
         content
             .environment(\\.__peekGeneration, generation)
             .onReceive(NotificationCenter.default.publisher(for: __peekBumpNotification)) { _ in generation += 1 }
+            .__peekLanguage(__peekLanguageCode)
     }
+}
+
+/// The language `peek dev --language` asked for: strings come from its .lproj (see
+/// __peekLocalizeFromModule), and SwiftUI formats and lays out for it.
+nonisolated(unsafe) var __peekLanguageCode: String?
+
+extension SwiftUI.View {
+    @SwiftUI.ViewBuilder func __peekLanguage(_ language: String?) -> some SwiftUI.View {
+        if let language {
+            let rightToLeft = Locale.Language(identifier: language).characterDirection == .rightToLeft
+            self.environment(\\.locale, Locale(identifier: language))
+                .environment(\\.layoutDirection, rightToLeft ? .rightToLeft : .leftToRight)
+        } else {
+            self
+        }
+    }
+}
+
+/// The part of a bundle with one language's strings (its <language>.lproj), if it has one.
+func __peekLocalized(_ bundle: Bundle) -> Bundle {
+    guard let language = __peekLanguageCode else { return bundle }
+    let names = [language, language.split(separator: "-").first.map(String.init) ?? language]
+    for name in names {
+        if let path = bundle.path(forResource: name, ofType: "lproj"), let lproj = Bundle(path: path) {
+            return lproj
+        }
+    }
+    return bundle
 }
 
 @_cdecl("peek_bump")
@@ -1581,7 +1610,8 @@ extension Foundation.Bundle {
 }
 
 // An app finds its strings in its main bundle (Text("key") looks there), which under peek is
-// Peek's: what the main bundle lacks is looked up in the app's own bundle instead.
+// Peek's: what the main bundle lacks is looked up in the app's own bundle instead. With
+// `--language`, every bundle is read in that language (see __peekLocalized).
 let __peekLocalizeFromModule: Void = {
     let module = Bundle.module
     print("peek: strings missing from the main bundle come from \\(module === Bundle.main ? "nowhere (no app bundle)" : module.bundlePath)")
@@ -1597,9 +1627,9 @@ let __peekLocalizeFromModule: Void = {
         typealias Lookup = @convention(c) (Bundle, Selector, NSString, NSString?, NSString?) -> NSString
         let selector = NSSelectorFromString("localizedStringForKey:value:table:")
         let lookup: @convention(block) (Bundle, NSString, NSString?, NSString?) -> NSString = { bundle, key, value, table in
-            let found = unsafeBitCast(original, to: Lookup.self)(bundle, selector, key, value, table)
+            let found = unsafeBitCast(original, to: Lookup.self)(__peekLocalized(bundle), selector, key, value, table)
             guard bundle === Bundle.main, missing(found, key, value, "localizedString(forKey:value:table:)") else { return found }
-            return unsafeBitCast(original, to: Lookup.self)(module, selector, key, value, table)
+            return unsafeBitCast(original, to: Lookup.self)(__peekLocalized(module), selector, key, value, table)
         }
         method_setImplementation(method, imp_implementationWithBlock(lookup))
     }
@@ -1608,9 +1638,9 @@ let __peekLocalizeFromModule: Void = {
         typealias Lookup = @convention(c) (Bundle, Selector, NSString, NSString?, NSString?, NSArray?) -> NSString
         let selector = NSSelectorFromString("localizedStringForKey:value:table:localizations:")
         let lookup: @convention(block) (Bundle, NSString, NSString?, NSString?, NSArray?) -> NSString = { bundle, key, value, table, languages in
-            let found = unsafeBitCast(original, to: Lookup.self)(bundle, selector, key, value, table, languages)
+            let found = unsafeBitCast(original, to: Lookup.self)(__peekLocalized(bundle), selector, key, value, table, languages)
             guard bundle === Bundle.main, missing(found, key, value, "localizedString(forKey:value:table:localizations:)") else { return found }
-            return unsafeBitCast(original, to: Lookup.self)(module, selector, key, value, table, languages)
+            return unsafeBitCast(original, to: Lookup.self)(__peekLocalized(module), selector, key, value, table, languages)
         }
         method_setImplementation(method, imp_implementationWithBlock(lookup))
     }
@@ -1620,9 +1650,9 @@ let __peekLocalizeFromModule: Void = {
         typealias Lookup = @convention(c) (Bundle, Selector, NSString, NSString?, NSString?) -> NSAttributedString
         let selector = NSSelectorFromString("localizedAttributedStringForKey:value:table:")
         let lookup: @convention(block) (Bundle, NSString, NSString?, NSString?) -> NSAttributedString = { bundle, key, value, table in
-            let found = unsafeBitCast(original, to: Lookup.self)(bundle, selector, key, value, table)
+            let found = unsafeBitCast(original, to: Lookup.self)(__peekLocalized(bundle), selector, key, value, table)
             guard bundle === Bundle.main, missing(found.string as NSString, key, value, "localizedAttributedString(forKey:value:table:)") else { return found }
-            return unsafeBitCast(original, to: Lookup.self)(module, selector, key, value, table)
+            return unsafeBitCast(original, to: Lookup.self)(__peekLocalized(module), selector, key, value, table)
         }
         method_setImplementation(method, imp_implementationWithBlock(lookup))
     }
@@ -2629,6 +2659,7 @@ class Builder:
         self.ios_override = args.ios
         self.swift_version = args.swift_version
         self.extra = args.swiftc_flag or []
+        self.language = getattr(args, "language", None)
         self.incremental = not getattr(args, "no_incremental", False)
         # Hot patching keeps view state across edits that only change function bodies.
         self.tests = getattr(args, "tests", False)  # run the test targets on the phone instead of previews
@@ -3031,7 +3062,8 @@ class Builder:
                                                     if self.uses_xctest else XCTEST_NONE)
                             if self.tests else ""))
         write_if_changed(entry, ENTRY_TEMPLATE.replace("%CASES%", body)
-                         .replace("%PREPARE%", ("    _ = __peekLocalizeFromModule\n" if bundle_name else "")
+                         .replace("%PREPARE%", (f"    __peekLanguageCode = {swift_string(self.language)}\n" if self.language else "")
+                                  + ("    _ = __peekLocalizeFromModule\n" if bundle_name else "")
                                   + f"    __peekStoreFolder({swift_string(self.name)})\n"))
         files = [c for c, _ in inputs] + [support, entry]
         for stale in srcdir.glob("*.swift"):
@@ -4581,6 +4613,7 @@ def main():
         p.add_argument("--no-incremental", action="store_true", help="compile everything on every change, as a new module")
         p.add_argument("--no-hot", action="store_true", help="always reload the whole build (state resets on every edit)")
         p.add_argument("--swiftc-flag", action="append", help="extra flag passed to swiftc (repeatable)")
+        p.add_argument("--language", help="show the app in this language (e.g. de, ko, ar), whatever the phone's is")
 
     dev = sub.add_parser("dev", help="watch, build and serve previews to the phone")
     common(dev)
