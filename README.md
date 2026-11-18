@@ -147,6 +147,19 @@ version, and does a test build.
 | `peek dev File.swift` | just that file |
 | `peek dev Folder/` | every `.swift` file under `Folder/Sources` (or `Folder/`) |
 | `peek dev Package/` (has a `Package.swift`) | the app's target, linked against its package dependencies |
+| `peek dev App.xcodeproj` (or its folder) | the project's app target, as a package (below) |
+
+**Xcode projects.** peek reads the `.xcodeproj` and builds its app target (or
+`--target Name`) as a Swift package it keeps in `~/.peek/xcode`: the target's
+files are linked there, its Swift package products become dependencies (at the
+versions in the project's `Package.resolved`), every local package in the
+project is a root package the way Xcode treats it, and the Debug settings
+`SWIFT_VERSION`, `IPHONEOS_DEPLOYMENT_TARGET`, `SWIFT_ACTIVE_COMPILATION_CONDITIONS`,
+default actor isolation and upcoming features carry over. Both kinds of groups
+work, including Xcode 16 folders and their exceptions. Unit and UI test targets
+become test targets for `peek test`. Not read: `.xcconfig` files, build phase
+scripts, other targets (extensions) and CocoaPods workspaces. Adding a file to
+the project needs a restart of `peek dev`.
 
 **Build settings.** In a package, the previewed target's Swift language mode
 and `swiftSettings` (`define`, upcoming and experimental features, default

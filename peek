@@ -366,11 +366,11 @@ def _scene_end(src, start):
 def _rewrite_app(src, mask, m, edits):
     """The @main App at match m becomes a view showing its first window's content."""
     close = match_close(src, m.end() - 1)
-    conformance = re.search(r"\bApp\b", m.group(2))
+    conformance = re.search(r"\b(?:SwiftUI\s*\.\s*)?App\b", m.group(2))  # `App` or `SwiftUI.App`
     if not conformance or close < 0:
         return None
     start = m.start(2) + conformance.start()
-    edits.append((start, start + 3, "SwiftUI.View"))
+    edits.append((start, m.start(2) + conformance.end(), "SwiftUI.View"))
     for scene in re.finditer(r"\bsome\s+Scene\b", mask[m.end():close]):
         edits.append((m.end() + scene.start(), m.end() + scene.end(), "some SwiftUI.View"))
     for adaptor in re.finditer(r"@UIApplicationDelegateAdaptor\b", mask[m.end():close]):
@@ -450,6 +450,28 @@ def _rewrite_preview(src, m, name):
     return m.start(), close + 1, head + "\n".join(lines) + "} } }", title
 
 
+DIRECTIVE_RE = re.compile(r"^[ \t]*#(if|elseif|else|endif)\b(.*)$", re.M)
+
+
+def active_condition(mask, pos):
+    """The `#if` condition under which the code at pos is compiled, or None when it always is."""
+    frames = []  # one list of branch conditions per open #if (None for #else)
+    for m in DIRECTIVE_RE.finditer(mask, 0, pos):
+        kind, cond = m.group(1), m.group(2).strip()
+        if kind == "if":
+            frames.append([cond])
+        elif kind in ("elseif", "else") and frames:
+            frames[-1].append(cond if kind == "elseif" else None)
+        elif kind == "endif" and frames:
+            frames.pop()
+    parts = []
+    for branches in frames:
+        parts += [f"!({c})" for c in branches[:-1]]
+        if branches[-1] is not None:
+            parts.append(f"({branches[-1]})")
+    return " && ".join(parts) or None
+
+
 def rewrite_source(src, tag="0", keep_shape=frozenset()):
     """Makes a source file previewable without changing its line numbers.
 
@@ -457,7 +479,7 @@ def rewrite_source(src, tag="0", keep_shape=frozenset()):
       (its body may build a SwiftUI view, a UIViewController or a UIView);
     - the `@main` App becomes a plain view showing its first WindowGroup's content, so a whole
       app can be previewed even when it has no #Preview.
-    Returns (new_source, [(struct_name, title or None)], app_struct_name or None).
+    Returns (new_source, [(struct_name, title or None, #if condition or None)], app_struct_name or None).
     """
     roots, app = [], None
     mask = code_mask(src)
@@ -474,7 +496,7 @@ def rewrite_source(src, tag="0", keep_shape=frozenset()):
             start, end, text, title = found
             edits.append((start, end, text))
             spans.append((start, end))
-            roots.append((name, title))
+            roots.append((name, title, active_condition(mask, start)))
     # Every View struct reads the hot-patch generation, so a patch can make it re-render.
     for m in REFRESHABLE_STRUCT_RE.finditer(mask):
         if SYNTHESIZED_RE.search(m.group(0)) or m.group(1) in keep_shape or any(a <= m.start() < b for a, b in spans):
@@ -2263,6 +2285,326 @@ def flatten_asset_catalog(catalog):
             yield f"{imageset.stem}{suffix}{Path(filename).suffix}", imageset / filename
 
 
+# ------------------------------------------------------------------ Xcode projects
+
+def parse_pbxproj(text):
+    """Parses an Xcode project.pbxproj (an old-style ASCII property list) into dicts and lists."""
+    pos, n = 0, len(text)
+    bare = re.compile(r"[A-Za-z0-9_$/:.\-+]+")
+
+    def skip():
+        nonlocal pos
+        while pos < n:
+            if text[pos].isspace():
+                pos += 1
+            elif text.startswith("/*", pos):
+                pos = text.index("*/", pos) + 2
+            elif text.startswith("//", pos):
+                end = text.find("\n", pos)
+                pos = n if end < 0 else end
+            else:
+                return
+
+    def value():
+        nonlocal pos
+        skip()
+        char = text[pos]
+        if char == "{":
+            pos += 1
+            result = {}
+            while True:
+                skip()
+                if text[pos] == "}":
+                    pos += 1
+                    return result
+                key = value()
+                skip()
+                assert text[pos] == "=", f"expected = at {pos}"
+                pos += 1
+                result[key] = value()
+                skip()
+                assert text[pos] == ";", f"expected ; at {pos}"
+                pos += 1
+        if char == "(":
+            pos += 1
+            result = []
+            while True:
+                skip()
+                if text[pos] == ")":
+                    pos += 1
+                    return result
+                result.append(value())
+                skip()
+                if text[pos] == ",":
+                    pos += 1
+        if char == '"':
+            pos += 1
+            out = []
+            while text[pos] != '"':
+                if text[pos] == "\\":
+                    pos += 1
+                    out.append({"n": "\n", "t": "\t"}.get(text[pos], text[pos]))
+                else:
+                    out.append(text[pos])
+                pos += 1
+            pos += 1
+            return "".join(out)
+        match = bare.match(text, pos)
+        assert match, f"unexpected {char!r} at {pos}"
+        pos = match.end()
+        return match.group()
+
+    if text.startswith("// !$*UTF8*$!"):
+        pos = text.index("\n")
+    return value()
+
+
+class XcodeProject:
+    """The parts of an .xcodeproj peek needs to build its app target as a Swift package."""
+
+    def __init__(self, path):
+        self.path = path
+        self.dir = path.parent
+        data = parse_pbxproj((path / "project.pbxproj").read_text())
+        self.objects = data["objects"]
+        self.project = self.objects[data["rootObject"]]
+        self.parents = {}
+        for oid, obj in self.objects.items():
+            for child in obj.get("children", []):
+                self.parents[child] = oid
+        self.targets = [self.objects[t] for t in self.project.get("targets", [])
+                        if self.objects[t].get("isa") == "PBXNativeTarget"]
+
+    def file_path(self, oid):
+        """Where a file reference (or group) is on disk, or None for SDK and build-product files."""
+        obj = self.objects[oid]
+        tree, own = obj.get("sourceTree", "<group>"), obj.get("path", "")
+        if tree == "<absolute>":
+            return Path(own)
+        if tree == "SOURCE_ROOT":
+            return self.dir / own
+        if tree != "<group>":
+            return None
+        parent = self.parents.get(oid)
+        base = self.file_path(parent) if parent else self.dir  # the main group has no parent
+        return None if base is None else base / own
+
+    def settings(self, target, configuration="Debug"):
+        """The target's build settings for a configuration, on top of the project's."""
+        merged = {}
+        for owner in (self.project, target):
+            configs = self.objects[owner["buildConfigurationList"]]["buildConfigurations"]
+            for cid in configs:
+                config = self.objects[cid]
+                if config.get("name") == configuration:
+                    merged.update(config.get("buildSettings", {}))
+        return merged
+
+    def phase_files(self, target, isa):
+        files = []
+        for pid in target.get("buildPhases", []):
+            phase = self.objects[pid]
+            if phase.get("isa") != isa:
+                continue
+            for bid in phase.get("files", []):
+                ref = self.objects[bid].get("fileRef")
+                if not ref:
+                    continue
+                obj = self.objects[ref]
+                if obj.get("isa") == "PBXVariantGroup":  # Localizable.strings in each .lproj
+                    files += [p for c in obj.get("children", []) if (p := self.file_path(c))]
+                elif (p := self.file_path(ref)):
+                    files.append(p)
+        return files
+
+    def synchronized_files(self, target):
+        """Files of Xcode 16 folders ("buildable folders") that belong to the target."""
+        files = []
+        for gid in target.get("fileSystemSynchronizedGroups", []):
+            group = self.objects[gid]
+            folder = self.file_path(gid)
+            if folder is None or not folder.is_dir():
+                continue
+            excluded = set()
+            for eid in group.get("exceptions", []):
+                exception = self.objects[eid]
+                if exception.get("target") == self.target_id(target):
+                    excluded |= {folder / m for m in exception.get("membershipExceptions", [])}
+            for path in sorted(folder.rglob("*")):
+                inside_bundle = any(part.endswith((".xcassets", ".xcstrings", ".lproj", ".bundle"))
+                                    for part in path.relative_to(folder).parts[:-1])
+                if inside_bundle or path in excluded or any(e in path.parents for e in excluded):
+                    continue
+                if path.is_file() or path.suffix in (".xcassets", ".bundle"):
+                    files.append(path)
+        return files
+
+    def target_id(self, target):
+        return next(oid for oid, obj in self.objects.items() if obj is target)
+
+    def packages(self, target):
+        """[(product name, package reference object or None for a local package)]."""
+        result = []
+        for did in target.get("packageProductDependencies", []):
+            dep = self.objects[did]
+            ref = self.objects.get(dep.get("package", ""))
+            result.append((dep.get("productName", ""), ref))
+        return result
+
+    def local_package_dirs(self):
+        dirs = []
+        for oid, obj in self.objects.items():
+            if obj.get("isa") == "XCLocalSwiftPackageReference":
+                dirs.append(self.dir / obj.get("relativePath", ""))
+            elif obj.get("isa") == "PBXFileReference" and obj.get("lastKnownFileType") in ("wrapper", "folder"):
+                path = self.file_path(oid)
+                if path and (path / "Package.swift").exists():
+                    dirs.append(path)
+        return sorted(set(dirs))
+
+
+def swift_package_requirement(requirement):
+    kind = requirement.get("kind")
+    if kind == "upToNextMajorVersion":
+        return f'from: "{requirement["minimumVersion"]}"'
+    if kind == "upToNextMinorVersion":
+        return f'.upToNextMinor(from: "{requirement["minimumVersion"]}")'
+    if kind == "exactVersion":
+        return f'exact: "{requirement["version"]}"'
+    if kind == "versionRange":
+        return f'"{requirement["minimumVersion"]}"..<"{requirement["maximumVersion"]}"'
+    if kind == "branch":
+        return f'branch: "{requirement["branch"]}"'
+    if kind == "revision":
+        return f'revision: "{requirement["revision"]}"'
+    raise ValueError(f"unknown package requirement {kind}")
+
+
+def xcode_wrapper(path, wanted=None):
+    """A Swift package peek builds instead of an .xcodeproj: its app target's files are links.
+
+    Returns the package's folder (under ~/.peek/xcode); it is made again whenever peek starts."""
+    project = XcodeProject(path)
+    apps = [t for t in project.targets if t.get("productType") == "com.apple.product-type.application"]
+    chosen = [t for t in project.targets if t.get("name") == wanted] if wanted else apps[:1]
+    if not chosen:
+        names = ", ".join(t.get("name", "?") for t in project.targets)
+        sys.exit(f"peek: no {'target ' + wanted if wanted else 'app target'} in {path.name} (targets: {names})")
+    app = chosen[0]
+    name = re.sub(r"\W", "_", app["name"])
+    out = STATE_DIR / "xcode" / hashlib.sha1(str(path).encode()).hexdigest()[:12]
+    if out.exists():
+        shutil.rmtree(out)
+    settings = project.settings(app)
+
+    def link_files(target, folder):
+        """Links the target's files into the wrapper; returns the resources to declare."""
+        sources = project.phase_files(target, "PBXSourcesBuildPhase")
+        resources = project.phase_files(target, "PBXResourcesBuildPhase")
+        for path in project.synchronized_files(target):
+            (sources if path.suffix in (".swift", ".m", ".c", ".mm", ".cpp") else resources).append(path)
+        plist = settings.get("INFOPLIST_FILE")
+        info = (project.dir / plist).resolve() if plist else None
+        declared = []
+        for path in sources + resources:
+            # Interface Builder files need a Mac; the Info.plist and build files are not resources.
+            if (not path.exists() or path.resolve() == info or path.name == "Info.plist"
+                    or path.suffix in (".storyboard", ".xib", ".entitlements", ".xcconfig")):
+                continue
+            try:
+                rel = path.relative_to(project.dir)
+            except ValueError:
+                rel = Path("External") / path.name
+            dest = folder / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if not dest.exists():
+                dest.symlink_to(path)
+            if path in resources:
+                declared.append(rel)
+        return declared
+
+    target_dir = out / "Sources" / name
+    target_dir.mkdir(parents=True)
+    resources = link_files(app, target_dir)
+
+    # Package products: remote ones by URL, local ones by the folder that has the product.
+    packages, products = {}, []
+    local_dirs = project.local_package_dirs()
+    for product, ref in project.packages(app):
+        if ref and ref.get("isa") == "XCRemoteSwiftPackageReference":
+            url = ref["repositoryURL"]
+            identity = re.sub(r"\.git$", "", url.rstrip("/").rsplit("/", 1)[-1])
+            packages[identity.lower()] = f'.package(url: "{url}", {swift_package_requirement(ref.get("requirement", {}))})'
+        else:
+            folder = project.dir / ref["relativePath"] if ref else next(
+                (d for d in local_dirs if re.search(rf'name:\s*"{re.escape(product)}"', (d / "Package.swift").read_text())), None)
+            if folder is None:
+                log(f"peek: {product} comes from a package {path.name} does not show; it is left out", "yellow")
+                continue
+            identity = folder.name
+            packages[identity.lower()] = f'.package(path: {json.dumps(str(folder))})'
+        products.append(f'.product(name: "{product}", package: "{identity}")')
+    # Xcode makes every local package in the project a root, so one may find another by path.
+    for folder in local_dirs:
+        packages.setdefault(folder.name.lower(), f'.package(path: {json.dumps(str(folder))})')
+
+    swift_settings = []
+    conditions = settings.get("SWIFT_ACTIVE_COMPILATION_CONDITIONS", [])
+    for define in conditions.split() if isinstance(conditions, str) else conditions:
+        if define not in ("DEBUG", "$(inherited)"):
+            swift_settings.append(f'.define("{define}")')
+    if settings.get("SWIFT_DEFAULT_ACTOR_ISOLATION") == "MainActor":
+        swift_settings.append(".defaultIsolation(MainActor.self)")
+    features = {k[len("SWIFT_UPCOMING_FEATURE_"):] for k, v in settings.items()
+                if k.startswith("SWIFT_UPCOMING_FEATURE_") and v == "YES"}
+    if settings.get("SWIFT_APPROACHABLE_CONCURRENCY") == "YES":
+        features |= {"InferIsolatedConformances", "NonisolatedNonsendingByDefault"}
+    swift_settings += [f'.enableUpcomingFeature("{f}")' for f in sorted(features)]
+    language = str(settings.get("SWIFT_VERSION", "5.0")).split(".")[0]
+    ios = settings.get("IPHONEOS_DEPLOYMENT_TARGET", "17.0")
+    region = project.project.get("developmentRegion", "en")
+
+    tests = []
+    for target in project.targets:
+        if target.get("productType") in ("com.apple.product-type.bundle.unit-test",
+                                         "com.apple.product-type.bundle.ui-testing"):
+            test_name = re.sub(r"\W", "_", target["name"])
+            folder = out / "Tests" / test_name
+            folder.mkdir(parents=True)
+            link_files(target, folder)
+            tests.append(f'.testTarget(name: "{test_name}", dependencies: ["{name}"])')
+
+    resource_list = ", ".join(f'.process({json.dumps(str(r))})' for r in resources)
+    manifest = f"""// swift-tools-version: 6.2
+// Made by peek from {path} — do not edit; peek makes it again on every start.
+import PackageDescription
+
+let package = Package(
+    name: "{name}",
+    defaultLocalization: "{region}",
+    platforms: [.iOS("{ios}")],
+    dependencies: [
+{"".join(f"        {d},{chr(10)}" for d in packages.values())}    ],
+    targets: [
+        .target(
+            name: "{name}",
+            dependencies: [{", ".join(products)}],
+            resources: [{resource_list}],
+            swiftSettings: [{", ".join(swift_settings)}]
+        ),
+{"".join(f"        {t},{chr(10)}" for t in tests)}    ],
+    swiftLanguageModes: [.v{language}]
+)
+"""
+    (out / "Package.swift").write_text(manifest)
+    resolved = path / "project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+    if resolved.exists():  # the versions Xcode resolved
+        shutil.copy(resolved, out / "Package.resolved")
+    (out / ".xcodeproj").write_text(str(path))
+    log(f"{path.name}: target {app['name']}, built as the package in {out}", "dim")
+    return out
+
+
 # ------------------------------------------------------------------ builder
 
 class Builder:
@@ -2271,6 +2613,14 @@ class Builder:
         target = Path(args.path).resolve()
         if not target.exists():
             sys.exit(f"peek: {target} does not exist")
+        self.xcodeproj = None
+        projects = [target] if target.suffix == ".xcodeproj" else \
+            sorted(target.glob("*.xcodeproj")) if target.is_dir() and not (target / "Package.swift").exists() else []
+        if len(projects) > 1:
+            sys.exit(f"peek: {target} has several Xcode projects; pass one: {', '.join(p.name for p in projects)}")
+        if projects:
+            self.xcodeproj = projects[0]
+            target = xcode_wrapper(projects[0], getattr(args, "target", None))
         self.single = target if target.is_file() else None
         self.root = target.parent if self.single else target
         self.root_expr = args.root
@@ -2302,7 +2652,7 @@ class Builder:
         if not self.incremental:
             shutil.rmtree(self.out / "obj", ignore_errors=True)
         (self.out / "src").mkdir(parents=True, exist_ok=True)
-        self.name = target.stem if self.single else target.name
+        self.name = self.xcodeproj.stem if self.xcodeproj else target.stem if self.single else target.name
         self.is_package = not self.single and (self.root / "Package.swift").exists()
         self.package = None
         self.package_error = None
@@ -2614,7 +2964,7 @@ class Builder:
         srcdir, objdir = self.out / "src", self.out / "obj"
         srcdir.mkdir(parents=True, exist_ok=True)
         objdir.mkdir(exist_ok=True)
-        roots, inputs, structs, app = [], [], [], None
+        roots, inputs, structs, app, conditions = [], [], [], None, []
         bundle_name, resources = self.resources()
         texts = {path: path.read_text(errors="replace") for path in sources}
         keep_shape = synthesized_elsewhere(texts.values())
@@ -2651,7 +3001,8 @@ class Builder:
         elif self.root_expr:
             cases = [(self.root_expr, self.root_expr)]
         elif roots and not self.prefer_app:
-            cases = [(f"{name}()", title or f"Preview {n + 1}") for n, (name, title) in enumerate(roots)]
+            cases = [(f"{name}()", title or f"Preview {n + 1}") for n, (name, title, _) in enumerate(roots)]
+            conditions = [c for _, _, c in roots]
         elif app:
             cases = [(f"{app}()", "App")]
         else:
@@ -2663,9 +3014,13 @@ class Builder:
             cases = [(f"{pick}()", pick)]
         if self.tests and self.uses_ui_tests:  # UI tests drive the app the previews would show
             cases = [(f"__PeekTestRunner(makeApp: {{ AnyView({cases[0][0]}) }})", "UI tests")]
+        conditions = conditions if len(conditions) == len(cases) else [None] * len(cases)
+        # A #Preview inside `#if os(macOS)` (say) is only referred to where it exists.
         body = "\n".join(
-            f"        case {i}: return UIHostingController(rootView: AnyView(__PeekGenerationRoot(content: AnyView({expr}))))"
-            for i, (expr, _) in enumerate(cases))
+            (f"#if {cond}\n" if cond else "")
+            + f"        case {i}: return UIHostingController(rootView: AnyView(__PeekGenerationRoot(content: AnyView({expr}))))"
+            + ("\n#endif" if cond else "")
+            for i, ((expr, _), cond) in enumerate(zip(cases, conditions)))
         support, entry = srcdir / "__PeekSupport.swift", srcdir / "__PeekEntry.swift"
         write_if_changed(support, SUPPORT_SOURCE + (BUNDLE_TEMPLATE.replace("%NAME%", bundle_name) if bundle_name else "")
                          + colors_source(self.colors)

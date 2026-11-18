@@ -70,13 +70,13 @@ class Rewrite(unittest.TestCase):
 
     def test_preview_becomes_struct(self):
         new, roots, _ = self.check_lines('#Preview("Hello") {\n    Text("hi")\n}\n')
-        self.assertEqual(roots, [("__PeekRoot_t_0", "Hello")])
+        self.assertEqual(roots, [("__PeekRoot_t_0", "Hello", None)])
         self.assertIn("struct __PeekRoot_t_0: SwiftUI.View", new)
         self.assertIn("__peekPreview {", new)
 
     def test_untitled_and_traits(self):
         _, roots, _ = self.check_lines("#Preview(traits: .landscapeLeft) { A() }\n#Preview { B() }\n")
-        self.assertEqual([t for _, t in roots], [None, None])
+        self.assertEqual([t for _, t, _ in roots], [None, None])
 
     def test_multiline_previewable(self):
         src = '#Preview {\n    @Previewable @State var items = [\n        1,\n        2,\n    ]\n    List(items) { Text("\\($0)") }\n}\n'
@@ -90,6 +90,18 @@ class Rewrite(unittest.TestCase):
     def test_preview_inside_string_is_ignored(self):
         _, roots, _ = self.check_lines('let s = "#Preview { X() }"\n')
         self.assertEqual(roots, [])
+
+    def test_preview_condition(self):
+        _, roots, _ = self.check_lines("#Preview { A() }\n#if os(macOS)\n#Preview { B() }\n#elseif DEBUG\n"
+                                       "#Preview { C() }\n#else\n#Preview { D() }\n#endif\n")
+        self.assertEqual([c for _, _, c in roots],
+                         [None, "(os(macOS))", "!(os(macOS)) && (DEBUG)", "!(os(macOS)) && !(DEBUG)"])
+
+    def test_qualified_app_becomes_view(self):
+        new, _, app = self.check_lines("@main\nstruct App: SwiftUI.App {\n    var body: some Scene {\n"
+                                       "        WindowGroup { V() }\n    }\n}\n")
+        self.assertEqual(app, "App")
+        self.assertIn("struct App: SwiftUI.View {", new)
 
     def test_app_becomes_view(self):
         src = (
@@ -815,3 +827,32 @@ class Actool(unittest.TestCase):
                             "NO", "--generate-swift-asset-symbols", str(symbols)], check=True, capture_output=True)
             self.assertIn('static let `brandLogo` = DeveloperToolsSupport.ImageResource(name: "brand-logo"',
                           symbols.read_text())
+
+
+class XcodeProjects(unittest.TestCase):
+    """An .xcodeproj becomes a Swift package of links (tests/fixtures/Sync: Xcode 16 folders)."""
+
+    def test_parse_pbxproj(self):
+        data = peek.parse_pbxproj('// !$*UTF8*$!\n{ a = 1; /* c */ b = ("x y", z,); c = {d = "q\\"e";}; }')
+        self.assertEqual(data, {"a": "1", "b": ["x y", "z"], "c": {"d": 'q"e'}})
+
+    def test_synchronized_folder_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state, peek.STATE_DIR = peek.STATE_DIR, Path(tmp)
+            try:
+                out = peek.xcode_wrapper(ROOT / "tests/fixtures/Sync/Sync.xcodeproj")
+            finally:
+                peek.STATE_DIR = state
+            files = sorted(str(p.relative_to(out / "Sources/Sync")) for p in (out / "Sources/Sync").rglob("*")
+                           if p.is_symlink())
+            self.assertEqual(files, ["Sync/Assets.xcassets", "Sync/Greeting.swift", "Sync/SyncApp.swift",
+                                     "Sync/Views/ContentView.swift"])  # Excluded.swift and Info.plist left out
+            manifest = (out / "Package.swift").read_text()
+            for part in ('.iOS("18.0")', '.define("FLAVOR_A")', ".defaultIsolation(MainActor.self)",
+                         '.process("Sync/Assets.xcassets")', "swiftLanguageModes: [.v6]"):
+                self.assertIn(part, manifest)
+
+    def test_package_requirements(self):
+        self.assertEqual(peek.swift_package_requirement({"kind": "upToNextMajorVersion", "minimumVersion": "2.1.1"}),
+                         'from: "2.1.1"')
+        self.assertEqual(peek.swift_package_requirement({"kind": "branch", "branch": "main"}), 'branch: "main"')
