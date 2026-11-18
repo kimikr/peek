@@ -743,7 +743,7 @@ func __peekStoreFolder(_ app: String) {
         if UserDefaults.standard.string(forKey: "PeekEraseStore") == app {
             UserDefaults.standard.removeObject(forKey: "PeekEraseStore")
             try? FileManager.default.removeItem(at: folder)
-            print("peek: erased \\(app)'s SwiftData store")
+            print("peek: erased the SwiftData store of \\(app)")
         }
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         print("peek: SwiftData's default store is Application Support/Peek/\\(app)/default.store")

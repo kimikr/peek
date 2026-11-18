@@ -52,12 +52,12 @@ struct MenuView: View {
                 }
                 if let project = session.server?.project {
                     Section {
-                        Button("Erase \(project)'s data and quit", role: .destructive) {
+                        Button("Erase saved data and quit", role: .destructive) {
                             UserDefaults.standard.set(project, forKey: "PeekEraseStore")
                             session.restart()
                         }
                     } footer: {
-                        Text("Deletes the SwiftData store the previews of this project saved. Open Peek again to start with no data.")
+                        Text("Deletes the SwiftData store the previews of \(project) saved. Open Peek again to start with no data.")
                     }
                 }
                 Section {
