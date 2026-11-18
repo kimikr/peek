@@ -165,6 +165,8 @@ class Toolchain:
                 log("peek: the SwiftData macros could not be built:\n" + (proc.stdout + proc.stderr)[-2000:], "red")
                 self._apple_macros = []
                 return []
+            for exe in exes:  # SwiftPM leaves them alone when nothing changed: mark them current
+                os.utime(exe)
         self._apple_macros = [a for n, e in zip(names, exes) for a in ("-load-plugin-executable", f"{e}#{n}")]
         return self._apple_macros
 
@@ -661,6 +663,7 @@ import SwiftUI
 import UIKit
 
 nonisolated(unsafe) var __peekPreviousExceptionHandler: (@convention(c) (NSException) -> Void)?
+nonisolated(unsafe) var __peekPreviousSignalHandlers = [sig_t?](repeating: nil, count: 32)
 
 @_cdecl("peek_entry")
 public func __peekEntry(_ index: Int32) -> UnsafeMutableRawPointer? {
@@ -673,6 +676,21 @@ public func __peekEntry(_ index: Int32) -> UnsafeMutableRawPointer? {
             print("*** \\(exception.name.rawValue): \\(exception.reason ?? "")\\n" + exception.callStackSymbols.joined(separator: "\\n"))
             fflush(stdout)
             __peekPreviousExceptionHandler?(exception)
+        }
+    }
+    // A crash (a Swift runtime trap, a bad access) otherwise leaves nothing in the output.
+    if getenv("PEEK_SIGNAL_HANDLER") == nil {
+        setenv("PEEK_SIGNAL_HANDLER", "1", 1)
+        for sig in [SIGTRAP, SIGILL, SIGSEGV, SIGBUS, SIGABRT, SIGFPE] {
+            __peekPreviousSignalHandlers[Int(sig)] = signal(sig) { sig in
+                // Not async-signal-safe, but the process is going down anyway.
+                print("*** signal \\(sig) (\\(String(cString: strsignal(sig))))\\n" + Thread.callStackSymbols.joined(separator: "\\n"))
+                fflush(stdout)
+                // The hosting app's own handler (LiveContainer's, say) runs next, then the default.
+                let previous = __peekPreviousSignalHandlers[Int(sig)]
+                signal(sig, previous)
+                raise(sig)
+            }
         }
     }
 %PREPARE%    let controller: UIViewController? = MainActor.assumeIsolated {
@@ -709,31 +727,37 @@ func __peekOriginal(_ cls: AnyClass, _ name: String) -> IMP? {
 // SwiftData's default store (Application Support/default.store) is in a folder every app run by
 // Peek shares (LiveContainer's app group): each previewed app gets a folder of its own there, or
 // opening one app's models would drop another's tables. Stores at a URL the app chose stay put.
+nonisolated(unsafe) var __peekStoreFolders = Set<String>()
+let __peekStoreLock = NSLock()  // Core Data reads URLs on any thread (a @ModelActor's, say)
+
 func __peekStoreFolder(_ app: String) {
     guard let cls = NSClassFromString("NSPersistentStoreDescription") else { return }  // no Core Data
     func moved(_ url: NSURL?) -> NSURL? {
         guard let url = url as URL?, url.isFileURL, url.lastPathComponent == "default.store",
               url.deletingLastPathComponent().lastPathComponent == "Application Support" else { return url as NSURL? }
         let folder = url.deletingLastPathComponent().appendingPathComponent("Peek/" + app, isDirectory: true)
+        guard __peekStoreLock.withLock({ __peekStoreFolders.insert(folder.path).inserted }) else {
+            return folder.appendingPathComponent(url.lastPathComponent) as NSURL
+        }
+        // Peek's menu asks for this before it quits: the store is not open yet when this runs.
+        if UserDefaults.standard.string(forKey: "PeekEraseStore") == app {
+            UserDefaults.standard.removeObject(forKey: "PeekEraseStore")
+            try? FileManager.default.removeItem(at: folder)
+            print("peek: erased \\(app)'s SwiftData store")
+        }
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         print("peek: SwiftData's default store is Application Support/Peek/\\(app)/default.store")
         return folder.appendingPathComponent(url.lastPathComponent) as NSURL
     }
-    if let original = __peekOriginal(cls, "initWithURL:"),
-       let method = class_getInstanceMethod(cls, NSSelectorFromString("initWithURL:")) {
-        typealias Init = @convention(c) (AnyObject, Selector, NSURL?) -> AnyObject
-        let initialize: @convention(block) (AnyObject, NSURL?) -> AnyObject = { object, url in
-            unsafeBitCast(original, to: Init.self)(object, NSSelectorFromString("initWithURL:"), moved(url))
+    // Only the getter is replaced: Core Data reads the URL there when it opens the store, and an
+    // init replaced through a block would get the ownership of its result wrong.
+    if let original = __peekOriginal(cls, "URL"),
+       let method = class_getInstanceMethod(cls, NSSelectorFromString("URL")) {
+        typealias Getter = @convention(c) (AnyObject, Selector) -> NSURL?
+        let get: @convention(block) (AnyObject) -> NSURL? = { object in
+            moved(unsafeBitCast(original, to: Getter.self)(object, NSSelectorFromString("URL")))
         }
-        method_setImplementation(method, imp_implementationWithBlock(initialize))
-    }
-    if let original = __peekOriginal(cls, "setURL:"),
-       let method = class_getInstanceMethod(cls, NSSelectorFromString("setURL:")) {
-        typealias Setter = @convention(c) (AnyObject, Selector, NSURL?) -> Void
-        let set: @convention(block) (AnyObject, NSURL?) -> Void = { object, url in
-            unsafeBitCast(original, to: Setter.self)(object, NSSelectorFromString("setURL:"), moved(url))
-        }
-        method_setImplementation(method, imp_implementationWithBlock(set))
+        method_setImplementation(method, imp_implementationWithBlock(get))
     }
 }
 
@@ -2589,7 +2613,7 @@ class Builder:
                             if self.tests else ""))
         write_if_changed(entry, ENTRY_TEMPLATE.replace("%CASES%", body)
                          .replace("%PREPARE%", ("    _ = __peekLocalizeFromModule\n" if bundle_name else "")
-                                  + f"    __peekStoreFolder({swift_string(self.root.name)})\n"))
+                                  + f"    __peekStoreFolder({swift_string(self.name)})\n"))
         files = [c for c, _ in inputs] + [support, entry]
         for stale in srcdir.glob("*.swift"):
             if stale not in files:

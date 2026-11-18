@@ -329,11 +329,17 @@ in the link is used. Pair with `peek link --qr` at any time.
 - **The preview lives in the Peek app's sandbox.** `UserDefaults`, the
   keychain and files are Peek's, so nothing your installed app has saved
   (settings, logins, caches) is there.
+- **`@Attribute(.transformable(by:))` with a transformer class of your own**
+  crashes inside SwiftData when the container is made (Apple's
+  `NSSecureUnarchiveFromDataTransformer` works). Not yet known whether peek's
+  build or SwiftData is at fault. `examples/SwiftDataCheck` checks the rest of
+  SwiftData on the phone.
 - **`Bundle.main` is the Peek app's bundle**, so `Image("name")` without
   `bundle: .module`, your `Info.plist` keys, URL schemes, app extensions and
   entitlements (HealthKit, push, iCloud, App Groups, …) are not your app's.
 - **A crash in your view crashes the Peek app.** When you open it again it
-  shows what the build printed last (a `fatalError` message, say) and loads
+  shows what the build printed last (a `fatalError` message, or the call stack
+  of a crash) and loads
   the next build on its own.
 - **Previewing Peek with Peek** shows "The last build quit the app" in the
   inner copy, because both copies share one set of preferences.
