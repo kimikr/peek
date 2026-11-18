@@ -1061,17 +1061,6 @@ extension SwiftUI.View {
     }
 }
 
-/// The part of a bundle with one language's strings (its <language>.lproj), if it has one.
-func __peekLocalized(_ bundle: Bundle) -> Bundle {
-    guard let language = __peekLanguageCode else { return bundle }
-    let names = [language, language.split(separator: "-").first.map(String.init) ?? language]
-    for name in names {
-        if let path = bundle.path(forResource: name, ofType: "lproj"), let lproj = Bundle(path: path) {
-            return lproj
-        }
-    }
-    return bundle
-}
 
 @_cdecl("peek_bump")
 public func __peekBump() {
@@ -1821,7 +1810,7 @@ let __peekResourcesFromModule: Void = {
 
 // An app finds its strings in its main bundle (Text("key") looks there), which under peek is
 // Peek's: what the main bundle lacks is looked up in the app's own bundle instead. With
-// `--language`, every bundle is read in that language (see __peekLocalized).
+// `--language`, every bundle is read in that language.
 let __peekLocalizeFromModule: Void = {
     let module = Bundle.module
     print("peek: strings missing from the main bundle come from \\(module === Bundle.main ? "nowhere (no app bundle)" : module.bundlePath)")
@@ -1831,26 +1820,36 @@ let __peekLocalizeFromModule: Void = {
         if seen.insert(via).inserted { print("peek: the app looks up strings with \\(via)") }
         return found == key || (value.map { found == $0 } ?? false)
     }
+    // With `--language`, every lookup asks for that localization (Apple's API for it).
+    typealias InLanguages = @convention(c) (Bundle, Selector, NSString, NSString?, NSString?, NSArray?) -> NSString
+    let languagesSelector = NSSelectorFromString("localizedStringForKey:value:table:localizations:")
+    let languagesOriginal = __peekOriginal(Bundle.self, "localizedStringForKey:value:table:localizations:")
+    func inLanguage(_ bundle: Bundle, _ key: NSString, _ value: NSString?, _ table: NSString?) -> NSString? {
+        guard let code = __peekLanguageCode, let languagesOriginal else { return nil }
+        let lookup = unsafeBitCast(languagesOriginal, to: InLanguages.self)
+        let found = lookup(bundle, languagesSelector, key, value, table, [code] as NSArray)
+        guard bundle === Bundle.main, missing(found, key, value, "a language") else { return found }
+        return lookup(module, languagesSelector, key, value, table, [code] as NSArray)
+    }
     // Text("key") and String(localized:) reach the bundle through either of these.
     if let original = __peekOriginal(Bundle.self, "localizedStringForKey:value:table:"),
        let method = class_getInstanceMethod(Bundle.self, NSSelectorFromString("localizedStringForKey:value:table:")) {
         typealias Lookup = @convention(c) (Bundle, Selector, NSString, NSString?, NSString?) -> NSString
         let selector = NSSelectorFromString("localizedStringForKey:value:table:")
         let lookup: @convention(block) (Bundle, NSString, NSString?, NSString?) -> NSString = { bundle, key, value, table in
-            let found = unsafeBitCast(original, to: Lookup.self)(__peekLocalized(bundle), selector, key, value, table)
+            if let found = inLanguage(bundle, key, value, table) { return found }
+            let found = unsafeBitCast(original, to: Lookup.self)(bundle, selector, key, value, table)
             guard bundle === Bundle.main, missing(found, key, value, "localizedString(forKey:value:table:)") else { return found }
-            return unsafeBitCast(original, to: Lookup.self)(__peekLocalized(module), selector, key, value, table)
+            return unsafeBitCast(original, to: Lookup.self)(module, selector, key, value, table)
         }
         method_setImplementation(method, imp_implementationWithBlock(lookup))
     }
-    if let original = __peekOriginal(Bundle.self, "localizedStringForKey:value:table:localizations:"),
-       let method = class_getInstanceMethod(Bundle.self, NSSelectorFromString("localizedStringForKey:value:table:localizations:")) {
-        typealias Lookup = @convention(c) (Bundle, Selector, NSString, NSString?, NSString?, NSArray?) -> NSString
-        let selector = NSSelectorFromString("localizedStringForKey:value:table:localizations:")
+    if let original = languagesOriginal, let method = class_getInstanceMethod(Bundle.self, languagesSelector) {
         let lookup: @convention(block) (Bundle, NSString, NSString?, NSString?, NSArray?) -> NSString = { bundle, key, value, table, languages in
-            let found = unsafeBitCast(original, to: Lookup.self)(__peekLocalized(bundle), selector, key, value, table, languages)
+            if let found = inLanguage(bundle, key, value, table) { return found }
+            let found = unsafeBitCast(original, to: InLanguages.self)(bundle, languagesSelector, key, value, table, languages)
             guard bundle === Bundle.main, missing(found, key, value, "localizedString(forKey:value:table:localizations:)") else { return found }
-            return unsafeBitCast(original, to: Lookup.self)(__peekLocalized(module), selector, key, value, table, languages)
+            return unsafeBitCast(original, to: InLanguages.self)(module, languagesSelector, key, value, table, languages)
         }
         method_setImplementation(method, imp_implementationWithBlock(lookup))
     }
@@ -1860,9 +1859,12 @@ let __peekLocalizeFromModule: Void = {
         typealias Lookup = @convention(c) (Bundle, Selector, NSString, NSString?, NSString?) -> NSAttributedString
         let selector = NSSelectorFromString("localizedAttributedStringForKey:value:table:")
         let lookup: @convention(block) (Bundle, NSString, NSString?, NSString?) -> NSAttributedString = { bundle, key, value, table in
-            let found = unsafeBitCast(original, to: Lookup.self)(__peekLocalized(bundle), selector, key, value, table)
+            if let text = inLanguage(bundle, key, value, table) {
+                return (try? NSAttributedString(markdown: text as String)) ?? NSAttributedString(string: text as String)
+            }
+            let found = unsafeBitCast(original, to: Lookup.self)(bundle, selector, key, value, table)
             guard bundle === Bundle.main, missing(found.string as NSString, key, value, "localizedAttributedString(forKey:value:table:)") else { return found }
-            return unsafeBitCast(original, to: Lookup.self)(__peekLocalized(module), selector, key, value, table)
+            return unsafeBitCast(original, to: Lookup.self)(module, selector, key, value, table)
         }
         method_setImplementation(method, imp_implementationWithBlock(lookup))
     }
