@@ -175,8 +175,6 @@ each run. The app runs in Peek's process, so state survives `launch()` and
   Peek's, and permission prompts show Peek's texts.
 - **Asset catalogs:** PDF images, data sets and stickers are not compiled. A
   dependency with a string catalog cannot be built on Linux.
-- **SwiftData:** `@Attribute(.transformable(by:))` with a transformer class of
-  your own crashes.
 - **A crash in your view crashes the Peek app**; open it again and the next
   build loads.
 
