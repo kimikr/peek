@@ -80,6 +80,21 @@ LiveContainer is signed with as a `.p12` file and use **Import a .p12 file…**.
 Then edit `examples/Counter/ContentView.swift` and save. If something does not
 work, `peek doctor` checks the whole setup.
 
+### Connecting the phone
+
+The pairing link lists the addresses the phone tries in turn:
+
+- **Same Wi-Fi.** The server's local address; it also advertises itself with
+  Bonjour, so a paired phone finds it again when the address changes.
+- **Tailscale.** The server's Tailscale address, from anywhere.
+- **Your own domain.** Put a reverse proxy in front of the server and pass its
+  address with its port: `peek dev MyApp --host dev.example.com:80`. The server
+  then listens on loopback for the proxy, and the phone reaches it over mobile
+  data too. Requests and replies are encrypted end to end either way.
+
+`--host` can be given more than once (`--host 100.64.0.5 --host dev.example.com:80`).
+`peek link --qr` prints the link again.
+
 ### What gets previewed
 
 - Every `#Preview` block (pick one from the green dot menu). `@Previewable`
