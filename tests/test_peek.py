@@ -873,3 +873,13 @@ class Breakpoints(unittest.TestCase):
         self.assertEqual(lines[2], src.split("\n")[2])
         self.assertIn("__peekBreak(false", lines[4])
         self.assertNotIn("__peekBreak", lines[3])
+
+    def test_inside_preview_and_after_code(self):
+        src = ('#Preview {\n    @Previewable @State var n = 0\n    // peek:log n\n    Text("hi")\n}\n'
+               'func f() {\n    let x = 1 // peek:log x\n}\n')
+        new, roots, _ = peek.rewrite_source(src)
+        self.assertEqual(new.count("\n"), src.count("\n"))
+        self.assertEqual(new.count("__peekBreak"), 2)
+        self.assertNotIn("} } }ine", new)  # no spliced fragment of the call
+        self.assertIn('let x = 1 ; __peekBreak(false', new)
+        self.assertIn('__peekPreview {     __peekBreak(false', new)

@@ -504,6 +504,8 @@ def breakpoint_edits(src):
             continue
         values = ", ".join(f"({swift_string(e)}, __peekDescribe({e}))" for e in split_expressions(m.group(2)))
         call = f"__peekBreak({'true' if m.group(1) == 'break' else 'false'}, #fileID, #line, [{values}])"
+        if src[src.rfind("\n", 0, m.start()) + 1:m.start()].strip():
+            call = "; " + call  # after code on the same line: `let x = 1 // peek:log x`
         edits.append((m.start(), m.end(), call))
     return edits
 
@@ -518,9 +520,12 @@ def rewrite_source(src, tag="0", keep_shape=frozenset()):
     Returns (new_source, [(struct_name, title or None, #if condition or None)], app_struct_name or None).
     """
     roots, app = [], None
+    # Breakpoints first, on their own: the other edits replace whole regions (a #Preview, a
+    # scene) with text taken from src, so a breakpoint inside one must already be in that text.
+    for start, end, text in sorted(breakpoint_edits(src), reverse=True):
+        src = src[:start] + text + src[end:]
     mask = code_mask(src)
     edits = []  # (start, end, replacement)
-    edits += breakpoint_edits(src)
     for m in MAIN_RE.finditer(mask):
         edits.append((m.start(), m.end(), " " * (m.end() - m.start())))
     for m in APP_RE.finditer(mask):
