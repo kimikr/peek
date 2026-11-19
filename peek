@@ -4361,8 +4361,18 @@ class Hub:
 
     def adopt(self, identifier):
         """Signs under the bundle identifier of the app that asks for builds (see Signer)."""
+        current = self.signer.identifier
+        if identifier and current and identifier != current and time.time() - getattr(self, "adopted", 0) < 60:
+            # Two phones whose Peek runs under different identifiers (one inside LiveContainer, say)
+            # would have every build re-signed for the other in turn: the first one keeps it.
+            if not getattr(self, "warned_identifiers", False):
+                self.warned_identifiers = True
+                log(f"two phones want builds signed for different apps ({current} and {identifier}); "
+                    f"builds stay signed for {current}", "yellow")
+            return
         if not self.signer.adopt(identifier):
             return
+        self.adopted = time.time()
         log(f"signing builds as {identifier}", "dim")
         with self.lock:
             if self.signer.ready:
