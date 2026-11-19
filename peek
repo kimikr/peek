@@ -1282,7 +1282,9 @@ struct __PeekTestRunner: SwiftUI.View {
             // A newer build can arrive while tests still run; each build is a module of its own,
             // so the process environment is the one place they all see. Wait for the earlier run.
             while getenv("PEEK_TESTS_RUNNING") != nil {
-                try? await Task.sleep(for: .milliseconds(200))
+                // Cancelled when a still newer build replaces this one: Task.sleep would then throw
+                // at once, and spinning on the main actor would stop the run being waited for.
+                do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
             }
             setenv("PEEK_TESTS_RUNNING", "1", 1)
             defer { unsetenv("PEEK_TESTS_RUNNING") }
