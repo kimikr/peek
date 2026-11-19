@@ -811,7 +811,7 @@ import UIKit
 /// its own and replaces the same methods again (the process keeps them): taking the current
 /// implementation as "the original" would chain every earlier build's replacement, and its
 /// stale state, into this one. The first original is kept under a second selector.
-func __peekOriginal(_ cls: AnyClass, _ name: String) -> IMP? {
+nonisolated func __peekOriginal(_ cls: AnyClass, _ name: String) -> IMP? {
     let saved = NSSelectorFromString("__peekOriginal_" + name)
     if let kept = class_getInstanceMethod(cls, saved) { return method_getImplementation(kept) }
     guard let method = class_getInstanceMethod(cls, NSSelectorFromString(name)) else { return nil }
@@ -825,7 +825,7 @@ func __peekOriginal(_ cls: AnyClass, _ name: String) -> IMP? {
 /// Bundle.main is Peek's: the keys of the app's own Info.plist (an API key, its display name,
 /// usage descriptions) are added to what Bundle.main shows the app. Keys the system and the
 /// hosting app read about the running process stay Peek's.
-func __peekAdoptAppInfo(_ xml: String) {
+nonisolated func __peekAdoptAppInfo(_ xml: String) {
     guard let app = (try? PropertyListSerialization.propertyList(from: Data(xml.utf8), format: nil)) as? [String: Any]
     else { return }
     let kept: Set<String> = ["CFBundleIdentifier", "CFBundleExecutable", "CFBundlePackageType", "CFBundleInfoDictionaryVersion",
@@ -865,8 +865,8 @@ func __peekAdoptAppInfo(_ xml: String) {
 /// and the .stringsdict one with each plural variable shown in its "other" form.
 // shortcut: plural rules are not applied (1 shows the "other" form too); enough to read a screen.
 nonisolated(unsafe) var __peekTables: [String: [String: String]] = [:]
-let __peekTablesLock = NSLock()
-func __peekTable(_ bundle: Bundle, _ name: String, _ language: String) -> [String: String] {
+nonisolated let __peekTablesLock = NSLock()
+nonisolated func __peekTable(_ bundle: Bundle, _ name: String, _ language: String) -> [String: String] {
     let id = bundle.bundlePath + "|" + name + "|" + language
     __peekTablesLock.lock()
     defer { __peekTablesLock.unlock() }
@@ -895,7 +895,7 @@ func __peekTable(_ bundle: Bundle, _ name: String, _ language: String) -> [Strin
 }
 
 /// What `// peek:break` and `// peek:log` show for a value: what `dump` prints, as `po` would.
-func __peekDescribe<T>(_ value: T) -> String {
+nonisolated func __peekDescribe<T>(_ value: T) -> String {
     var text = ""
     dump(value, to: &text, maxDepth: 4, maxItems: 50)
     text = text.trimmingCharacters(in: .newlines)
@@ -903,15 +903,15 @@ func __peekDescribe<T>(_ value: T) -> String {
     return !text.contains("\\n") && text.hasPrefix("- ") ? String(text.dropFirst(2)) : text
 }
 
-final class __PeekFlag: @unchecked Sendable { var on = false }
-let __peekBreakpointsOff = __PeekFlag()
+nonisolated final class __PeekFlag: @unchecked Sendable { var on = false }
+nonisolated let __peekBreakpointsOff = __PeekFlag()
 
 /// `// peek:break a, b` (pause: true) and `// peek:log a, b` (pause: false). A breakpoint prints
 /// the values and call stack, then holds the app at that line until Continue is tapped on the phone;
 /// the screen keeps working meanwhile (a nested run loop), so use it in actions, tasks and
 /// functions, not while SwiftUI computes a body. Returns a view so it also fits in a view builder.
 @discardableResult
-func __peekBreak(_ pause: Bool, _ file: StaticString, _ line: Int, _ values: [(String, String)]) -> SwiftUI.EmptyView {
+nonisolated func __peekBreak(_ pause: Bool, _ file: StaticString, _ line: Int, _ values: [(String, String)]) -> SwiftUI.EmptyView {
     var report = "peek: \\(pause ? "paused" : "log") at \\(file):\\(line)"
     for (name, value) in values {
         report += "\\n  \\(name) = " + value.replacingOccurrences(of: "\\n", with: "\\n    ")
@@ -935,7 +935,7 @@ func __peekBreak(_ pause: Bool, _ file: StaticString, _ line: Int, _ values: [(S
     return SwiftUI.EmptyView()
 }
 
-func __peekPause(_ report: String) {
+nonisolated func __peekPause(_ report: String) {
     MainActor.assumeIsolated {
         guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first else { return }
         let window = UIWindow(windowScene: scene)
@@ -976,9 +976,9 @@ func __peekPause(_ report: String) {
 }
 
 nonisolated(unsafe) var __peekStoreFolders = Set<String>()
-let __peekStoreLock = NSLock()  // Core Data reads URLs on any thread (a @ModelActor's, say)
+nonisolated let __peekStoreLock = NSLock()  // Core Data reads URLs on any thread (a @ModelActor's, say)
 
-func __peekStoreFolder(_ app: String) {
+nonisolated func __peekStoreFolder(_ app: String) {
     guard let cls = NSClassFromString("NSPersistentStoreDescription") else { return }  // no Core Data
     func moved(_ url: NSURL?) -> NSURL? {
         guard let url = url as URL?, url.isFileURL, url.lastPathComponent == "default.store",
