@@ -10,6 +10,7 @@ Swift SDK (as installed by xtool), ldid, openssl.
 """
 import argparse
 import base64
+import fcntl
 import hashlib
 import hmac
 import json
@@ -2930,6 +2931,13 @@ class Builder:
         target = Path(args.path).resolve()
         if not target.exists():
             sys.exit(f"peek: {target} does not exist")
+        # Runs on one project share its build folder (and an .xcodeproj's package): one at a time.
+        (STATE_DIR / "locks").mkdir(parents=True, exist_ok=True)
+        self._lock = open(STATE_DIR / "locks" / hashlib.sha1(str(target).encode()).hexdigest()[:12], "w")
+        try:
+            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            sys.exit(f"peek: another peek (dev, test or build) is working on {target.name}; stop it first")
         self.xcodeproj = None
         projects = [target] if target.suffix == ".xcodeproj" else \
             sorted(target.glob("*.xcodeproj")) if target.is_dir() and not (target / "Package.swift").exists() else []
@@ -4252,12 +4260,12 @@ class Hub:
 
     def patch_failed(self, message):
         """The phone could not load a patch: stop patching for this session and send a full build."""
-        if not self.builder.hot:
-            return
-        self.builder.hot = False
-        self.builder.base = None
-        log(f"the phone could not load a hot patch ({message}); reloading whole builds from now on", "yellow")
-        with self.lock:
+        with self.lock:  # a build may be running on another thread and reads both
+            if not self.builder.hot:
+                return
+            self.builder.hot = False
+            self.builder.base = None
+            log(f"the phone could not load a hot patch ({message}); reloading whole builds from now on", "yellow")
             self._rebuild()
 
     def _rebuild(self):
