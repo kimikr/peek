@@ -315,7 +315,7 @@ def code_mask(src):
 
 PREVIEW_RE = re.compile(r"#Preview\b")
 MAIN_RE = re.compile(r"@main\b")
-APP_RE = re.compile(r"@main\s+(?:\w+\s+)*?struct\s+(\w+)\s*:\s*([^{]*)\{")
+APP_RE = re.compile(r"@main\s+(?:@?\w+(?:\([^)]*\))?\s+)*?struct\s+(\w+)\s*:\s*([^{]*)\{")  # `@main @MainActor struct`
 VIEW_STRUCT_RE = re.compile(r"\bstruct\s+(\w+)\s*(?:<[^>{]*>)?\s*:\s*[^{]*\bView\b[^{]*\{")
 # Structs that can read the environment and should re-render after a hot patch.
 REFRESHABLE_STRUCT_RE = re.compile(r"\bstruct\s+(\w+)\s*(?:<[^>{]*>)?\s*:\s*[^{]*\b(?:View|ViewModifier)\b[^{]*\{")
@@ -1857,8 +1857,9 @@ let __peekLocalizeFromModule: Void = {
     print("peek: strings missing from the main bundle come from \\(module === Bundle.main ? "nowhere (no app bundle)" : module.bundlePath)")
     guard module !== Bundle.main else { return }
     nonisolated(unsafe) var seen = Set<String>()
+    let seenLock = NSLock()  // strings are looked up on any thread
     func missing(_ found: NSString, _ key: NSString, _ value: NSString?, _ via: String) -> Bool {
-        if seen.insert(via).inserted { print("peek: the app looks up strings with \\(via)") }
+        if seenLock.withLock({ seen.insert(via).inserted }) { print("peek: the app looks up strings with \\(via)") }
         return found == key || (value.map { found == $0 } ?? false)
     }
     // With `--language`, every lookup is answered in that language.
@@ -2754,19 +2755,19 @@ class XcodeProject:
 
 
 def swift_package_requirement(requirement):
-    kind = requirement.get("kind")
+    kind, q = requirement.get("kind"), lambda key: swift_string(str(requirement[key]))
     if kind == "upToNextMajorVersion":
-        return f'from: "{requirement["minimumVersion"]}"'
+        return f"from: {q('minimumVersion')}"
     if kind == "upToNextMinorVersion":
-        return f'.upToNextMinor(from: "{requirement["minimumVersion"]}")'
+        return f".upToNextMinor(from: {q('minimumVersion')})"
     if kind == "exactVersion":
-        return f'exact: "{requirement["version"]}"'
+        return f"exact: {q('version')}"
     if kind == "versionRange":
-        return f'"{requirement["minimumVersion"]}"..<"{requirement["maximumVersion"]}"'
+        return f"{q('minimumVersion')}..<{q('maximumVersion')}"
     if kind == "branch":
-        return f'branch: "{requirement["branch"]}"'
+        return f"branch: {q('branch')}"
     if kind == "revision":
-        return f'revision: "{requirement["revision"]}"'
+        return f"revision: {q('revision')}"
     raise ValueError(f"unknown package requirement {kind}")
 
 
@@ -2824,7 +2825,7 @@ def xcode_wrapper(path, wanted=None):
         if ref and ref.get("isa") == "XCRemoteSwiftPackageReference":
             url = ref["repositoryURL"]
             identity = re.sub(r"\.git$", "", url.rstrip("/").rsplit("/", 1)[-1])
-            packages[identity.lower()] = f'.package(url: "{url}", {swift_package_requirement(ref.get("requirement", {}))})'
+            packages[identity.lower()] = f'.package(url: {swift_string(url)}, {swift_package_requirement(ref.get("requirement", {}))})'
         else:
             folder = project.dir / ref["relativePath"] if ref else next(
                 (d for d in local_dirs if re.search(rf'name:\s*"{re.escape(product)}"', (d / "Package.swift").read_text())), None)
@@ -2832,16 +2833,16 @@ def xcode_wrapper(path, wanted=None):
                 log(f"peek: {product} comes from a package {path.name} does not show; it is left out", "yellow")
                 continue
             identity = folder.name
-            packages[identity.lower()] = f'.package(path: {json.dumps(str(folder))})'
-        products.append(f'.product(name: "{product}", package: "{identity}")')
+            packages[identity.lower()] = f'.package(path: {swift_string(str(folder))})'
+        products.append(f'.product(name: {swift_string(product)}, package: {swift_string(identity)})')
     # Xcode makes every local package in the project a root, so one may find another by path.
     for folder in local_dirs:
-        packages.setdefault(folder.name.lower(), f'.package(path: {json.dumps(str(folder))})')
+        packages.setdefault(folder.name.lower(), f'.package(path: {swift_string(str(folder))})')
 
     swift_settings = []
     conditions = settings.get("SWIFT_ACTIVE_COMPILATION_CONDITIONS", [])
     for define in conditions.split() if isinstance(conditions, str) else conditions:
-        if define not in ("DEBUG", "$(inherited)"):
+        if define not in ("DEBUG", "$(inherited)") and re.fullmatch(r"[A-Za-z_]\w*", define):
             swift_settings.append(f'.define("{define}")')
     if settings.get("SWIFT_DEFAULT_ACTOR_ISOLATION") == "MainActor":
         swift_settings.append(".defaultIsolation(MainActor.self)")
@@ -2849,9 +2850,11 @@ def xcode_wrapper(path, wanted=None):
                 if k.startswith("SWIFT_UPCOMING_FEATURE_") and v == "YES"}
     if settings.get("SWIFT_APPROACHABLE_CONCURRENCY") == "YES":
         features |= {"InferIsolatedConformances", "NonisolatedNonsendingByDefault"}
-    swift_settings += [f'.enableUpcomingFeature("{f}")' for f in sorted(features)]
+    swift_settings += [f'.enableUpcomingFeature("{f}")' for f in sorted(features) if re.fullmatch(r"\w+", f)]
     language = str(settings.get("SWIFT_VERSION", "5.0")).split(".")[0]
-    ios = settings.get("IPHONEOS_DEPLOYMENT_TARGET", "17.0")
+    language = language if language in ("4", "5", "6") else "5"
+    ios = str(settings.get("IPHONEOS_DEPLOYMENT_TARGET", "17.0"))
+    ios = ios if re.fullmatch(r"\d+(\.\d+)*", ios) else "17.0"
     region = project.project.get("developmentRegion", "en")
 
     tests = []
@@ -2862,16 +2865,16 @@ def xcode_wrapper(path, wanted=None):
             folder = out / "Tests" / test_name
             folder.mkdir(parents=True)
             link_files(target, folder)
-            tests.append(f'.testTarget(name: "{test_name}", dependencies: ["{name}"])')
+            tests.append(f'.testTarget(name: "{test_name}", dependencies: ["{name}"])')  # both names are made of word characters
 
-    resource_list = ", ".join(f'.process({json.dumps(str(r))})' for r in resources)
+    resource_list = ", ".join(f'.process({swift_string(str(r))})' for r in resources)
     manifest = f"""// swift-tools-version: 6.2
 // Made by peek from {path} — do not edit; peek makes it again on every start.
 import PackageDescription
 
 let package = Package(
     name: "{name}",
-    defaultLocalization: "{region}",
+    defaultLocalization: {swift_string(region)},
     platforms: [.iOS("{ios}")],
     dependencies: [
 {"".join(f"        {d},{chr(10)}" for d in packages.values())}    ],

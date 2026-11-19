@@ -62,8 +62,12 @@ if let swiftPath = options["--generate-swift-asset-symbols"] {
     }
     func constants(_ type: String, _ names: [String], dropping suffix: String) -> String {
         guard !names.isEmpty else { return "" }
-        let lines = names.map {
-            "    static let \(symbol($0, dropping: suffix)) = DeveloperToolsSupport.\(type)(name: \"\($0)\", bundle: resourceBundle)"
+        var used = Set<String>()  // "Brand Color" and "brand-color" make the same symbol: the first wins
+        let lines = names.compactMap { name -> String? in
+            let constant = symbol(name, dropping: suffix)
+            guard used.insert(constant).inserted else { return nil }
+            let literal = name.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            return "    static let \(constant) = DeveloperToolsSupport.\(type)(name: \"\(literal)\", bundle: resourceBundle)"
         }
         return "@available(iOS 17.0, macOS 14.0, tvOS 17.0, watchOS 10.0, *)\nextension DeveloperToolsSupport.\(type) {\n"
             + lines.joined(separator: "\n") + "\n}\n\n"

@@ -98,6 +98,12 @@ class Rewrite(unittest.TestCase):
         self.assertEqual([c for _, _, c in roots],
                          [None, "(os(macOS))", "!(os(macOS)) && (DEBUG)", "!(os(macOS)) && !(DEBUG)"])
 
+    def test_app_with_attributes(self):
+        new, _, app = self.check_lines("@main\n@MainActor\nstruct MyApp: App {\n    var body: some Scene {\n"
+                                       "        WindowGroup { V() }\n    }\n}\n")
+        self.assertEqual(app, "MyApp")
+        self.assertIn("struct MyApp: SwiftUI.View", new)
+
     def test_qualified_app_becomes_view(self):
         new, _, app = self.check_lines("@main\nstruct App: SwiftUI.App {\n    var body: some Scene {\n"
                                        "        WindowGroup { V() }\n    }\n}\n")
