@@ -177,8 +177,8 @@ class Toolchain:
         Xcode has these only as macOS binaries, and the Linux toolchain's #Predicate expands to
         FoundationEssentials, which iOS lacks. Built on first use by code that needs them."""
         cached = getattr(self, "_apple_macros", None)
-        if cached or (cached is not None and not needed):
-            return cached
+        if cached or (cached is not None and (not needed or getattr(self, "_tools_failed", False))):
+            return cached  # a failed build is not tried again until peek restarts (watch loops call this)
         source = Path(__file__).resolve().parent / "tools"
         scratch = Path.home() / ".peek/macros"
         names = ("SwiftDataMacros", "FoundationMacros", "actool")
@@ -199,7 +199,7 @@ class Toolchain:
                                    "--scratch-path", str(scratch)], capture_output=True, text=True)
             if proc.returncode != 0 or not all(e.exists() for e in exes):
                 log("peek: the tools in tools/ could not be built:\n" + (proc.stdout + proc.stderr)[-2000:], "red")
-                self._apple_macros = []
+                self._apple_macros, self._tools_failed = [], True
                 return []
             for exe in exes:  # SwiftPM leaves them alone when nothing changed: mark them current
                 os.utime(exe)
@@ -3037,12 +3037,15 @@ class Builder:
         newest = max((p.stat().st_mtime for p in catalog.rglob("*")), default=0)
         if car.exists() and car.stat().st_mtime >= newest:
             return car
+        if getattr(self, "_catalog_failed", None) == (catalog, newest):
+            return None  # failed already; tried again once the catalog changes
         proc = subprocess.run([str(actool), str(catalog), "--compile", str(out),
                                "--platform", "iphoneos", "--minimum-deployment-target", self.ios],
                               capture_output=True, text=True)
         if proc.returncode != 0:
             log(f"{catalog.name} could not be compiled, so its images are sent one by one: "
                 + proc.stderr.strip(), "yellow")
+            self._catalog_failed = (catalog, newest)
             return None
         return car
 
