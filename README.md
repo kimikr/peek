@@ -56,9 +56,13 @@ On the Linux machine:
 On the iPhone (iOS 17+):
 
 - SideStore or AltStore, or [LiveContainer](https://github.com/LiveContainer/LiveContainer)
-  in JIT-less mode
-- The phone and the Linux machine on the same Wi-Fi or the same
-  [Tailscale](https://tailscale.com) network
+  in JIT-less mode. A **free Apple ID** is all it takes: everything in this
+  README was tested with one, no paid developer account.
+- A way to reach the Linux machine: the same Wi-Fi, the same
+  [Tailscale](https://tailscale.com) network, or your own domain (see
+  [Connecting the phone](#connecting-the-phone))
+- Only for UI tests (XCUITest): [StikDebug](https://github.com/StephenDev0/StikDebug),
+  to mount the developer disk image. Previews and unit tests do not need it.
 
 ## Quick start
 
@@ -175,7 +179,6 @@ each run. The app runs in Peek's process, so state survives `launch()` and
   your own crashes.
 - **A crash in your view crashes the Peek app**; open it again and the next
   build loads.
-- **Free Apple IDs:** when the store re-issues the certificate, import it again.
 
 ## Development
 
