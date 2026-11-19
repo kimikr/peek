@@ -861,6 +861,39 @@ func __peekAdoptAppInfo(_ xml: String) {
     print("peek: Bundle.main also shows the app's Info.plist keys \\(extra.keys.sorted().joined(separator: ", "))")
 }
 
+/// One language's strings table of a bundle, read from its <language>.lproj: the .strings file,
+/// and the .stringsdict one with each plural variable shown in its "other" form.
+// shortcut: plural rules are not applied (1 shows the "other" form too); enough to read a screen.
+nonisolated(unsafe) var __peekTables: [String: [String: String]] = [:]
+let __peekTablesLock = NSLock()
+func __peekTable(_ bundle: Bundle, _ name: String, _ language: String) -> [String: String] {
+    let id = bundle.bundlePath + "|" + name + "|" + language
+    __peekTablesLock.lock()
+    defer { __peekTablesLock.unlock() }
+    if let table = __peekTables[id] { return table }
+    var table: [String: String] = [:]
+    for lproj in [language, String(language.split(separator: "-").first ?? "")] where table.isEmpty {
+        let folder = (bundle.bundlePath as NSString).appendingPathComponent(lproj + ".lproj")
+        if let plurals = NSDictionary(contentsOfFile: folder + "/" + name + ".stringsdict") as? [String: [String: Any]] {
+            for (key, entry) in plurals {
+                guard var format = entry["NSStringLocalizedFormatKey"] as? String else { continue }
+                for (variable, rule) in entry {
+                    if let forms = rule as? [String: Any], let other = forms["other"] as? String {
+                        format = format.replacingOccurrences(of: "%#@" + variable + "@", with: other)
+                    }
+                }
+                table[key] = format
+            }
+        }
+        if let strings = NSDictionary(contentsOfFile: folder + "/" + name + ".strings") as? [String: String] {
+            table.merge(strings) { $1 }
+        }
+    }
+    print("peek: \\(table.count) \\(language) strings in \\((bundle.bundlePath as NSString).lastPathComponent)/\\(name)")
+    __peekTables[id] = table
+    return table
+}
+
 /// What `// peek:break` and `// peek:log` show for a value: what `dump` prints, as `po` would.
 func __peekDescribe<T>(_ value: T) -> String {
     var text = ""
@@ -1052,9 +1085,10 @@ nonisolated(unsafe) var __peekLanguageCode: String?
 extension SwiftUI.View {
     @SwiftUI.ViewBuilder func __peekLanguage(_ language: String?) -> some SwiftUI.View {
         if let language {
+            // shortcut: \\.locale stays the phone's; with another locale SwiftUI looks strings up in a
+            // way peek does not catch (they showed as keys), so dates and numbers keep the phone's format.
             let rightToLeft = Locale.Language(identifier: language).characterDirection == .rightToLeft
-            self.environment(\\.locale, Locale(identifier: language))
-                .environment(\\.layoutDirection, rightToLeft ? .rightToLeft : .leftToRight)
+            self.environment(\\.layoutDirection, rightToLeft ? .rightToLeft : .leftToRight)
         } else {
             self
         }
@@ -1820,16 +1854,23 @@ let __peekLocalizeFromModule: Void = {
         if seen.insert(via).inserted { print("peek: the app looks up strings with \\(via)") }
         return found == key || (value.map { found == $0 } ?? false)
     }
-    // With `--language`, every lookup asks for that localization (Apple's API for it).
+    // With `--language`, every lookup is answered in that language.
     typealias InLanguages = @convention(c) (Bundle, Selector, NSString, NSString?, NSString?, NSArray?) -> NSString
     let languagesSelector = NSSelectorFromString("localizedStringForKey:value:table:localizations:")
     let languagesOriginal = __peekOriginal(Bundle.self, "localizedStringForKey:value:table:localizations:")
     func inLanguage(_ bundle: Bundle, _ key: NSString, _ value: NSString?, _ table: NSString?) -> NSString? {
         guard let code = __peekLanguageCode, let languagesOriginal else { return nil }
         let lookup = unsafeBitCast(languagesOriginal, to: InLanguages.self)
-        let found = lookup(bundle, languagesSelector, key, value, table, [code] as NSArray)
-        guard bundle === Bundle.main, missing(found, key, value, "a language") else { return found }
-        return lookup(module, languagesSelector, key, value, table, [code] as NSArray)
+        for source in bundle === Bundle.main ? [bundle, module] : [bundle] {
+            // The tables read directly come first: on iOS 27 that API misses tables of a downloaded
+            // bundle, and its plural strings lose their rules on the way ("%#@value@").
+            if let text = __peekTable(source, (table as String?) ?? "Localizable", code)[key as String] {
+                return text as NSString
+            }
+            let found = lookup(source, languagesSelector, key, value, table, [code] as NSArray)
+            if !missing(found, key, value, "a language") { return found }
+        }
+        return nil
     }
     // Text("key") and String(localized:) reach the bundle through either of these.
     if let original = __peekOriginal(Bundle.self, "localizedStringForKey:value:table:"),

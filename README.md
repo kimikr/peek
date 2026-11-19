@@ -221,9 +221,10 @@ See `examples/Weather` for a package with a dependency and a resource, and
   dark appearance and between text sizes, without touching the phone's
   settings.
 - **Language.** `peek dev --language de` (or `ko`, `ar`, `pt-BR`, …) shows the
-  app in that language whatever the phone's is: strings come from that
-  language's `.lproj` in every bundle, and SwiftUI's locale and layout
-  direction follow (right to left for Arabic and Hebrew).
+  app's strings in that language whatever the phone's is (from that
+  language's `.lproj` in every bundle), laid out right to left for Arabic and
+  Hebrew. Dates and numbers keep the phone's format, and a plural string always
+  shows its "other" form.
 - **Breakpoints.** A `// peek:break a, b.count` comment on its own line stops
   the app there: the phone shows the values (what `dump` prints, like `po`)
   and the call stack, the same goes to the `peek dev` output, and Continue
