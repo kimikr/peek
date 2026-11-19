@@ -4403,11 +4403,37 @@ class Hub:
                 "builds cannot load until the matching certificate is imported", "red")
 
 
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """At most MAX_CONNECTIONS requests at a time; more are closed at once (each takes a thread)."""
+    MAX_CONNECTIONS = 64
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.slots = threading.BoundedSemaphore(self.MAX_CONNECTIONS)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
 def make_handler(hub):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = f"peek/{VERSION}"
         sys_version = ""
+        timeout = 120  # a client that sends nothing for this long (a slow-loris) is dropped
 
         def log_message(self, *args):
             pass
@@ -4426,6 +4452,14 @@ def make_handler(hub):
             if isinstance(body, (dict, list)):
                 body = json.dumps(body).encode()
             self.reply(200, seal(hub.token, body), SEALED_TYPE)
+
+        def plausibly_authed(self):
+            """The auth header is well formed and current (its HMAC needs the body, read after this)."""
+            try:
+                stamp, mac = self.headers.get("X-Peek-Auth", "").split(":")
+                return abs(time.time() - int(stamp)) <= AUTH_WINDOW and len(mac) == 64
+            except ValueError:
+                return False
 
         def authed(self, body=b""):
             """Requests carry `X-Peek-Auth: <unix time>:<hex HMAC>` over auth_message()."""
@@ -4533,6 +4567,9 @@ def make_handler(hub):
             if length > (64 << 20 if url.path == "/v1/shot" else 4 << 20):
                 self.close_connection = True
                 return self.reply(413, {"error": "too large"})
+            if not self.plausibly_authed():  # before reading a body of up to 64 MB into memory
+                self.close_connection = True
+                return self.reply(401, {"error": "unauthorized"})
             body = self.rfile.read(length)
             if not self.authed(body):
                 return self.reply(401, {"error": "unauthorized"})
@@ -4669,7 +4706,7 @@ def cmd_dev(args):
     handler = make_handler(hub)
     for address in binds:
         try:
-            server = ThreadingHTTPServer((address, args.port), handler)
+            server = BoundedHTTPServer((address, args.port), handler)
         except OSError as e:
             sys.exit(f"peek: cannot listen on {address}:{args.port}: {e}")
         server.daemon_threads = True
