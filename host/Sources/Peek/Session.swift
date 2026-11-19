@@ -6,7 +6,7 @@ import os
 /// This app's release, and the version of the protocol it speaks with the `peek` script.
 /// Both must match the script's VERSION and PROTOCOL (the release script checks).
 enum PeekVersion {
-    static let app = "0.2.1"
+    static let app = "0.3.0"
     static let proto = 2
 }
 

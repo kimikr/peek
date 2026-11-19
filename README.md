@@ -13,10 +13,14 @@ behaves exactly as it will in your app.
   is on the phone in 1–2 s, and when you only change function bodies the running
   views are patched in place, so `@State` survives the reload.
 - **Your whole app.** `#Preview` blocks, UIKit views and controllers, or the
-  entire `@main` App (`DocumentGroup` too), with Swift, C, Objective-C, C++ and
-  `.xcframework` dependencies, macros, resources, colour sets and asset symbols.
-- **Tests on the device.** `peek test` runs your Swift Testing and XCTest suites on the
-  iPhone, with real UIKit and SwiftUI, every time you save.
+  entire `@main` App (`DocumentGroup` too), straight from a Swift package or an
+  `.xcodeproj`, with Swift, C, Objective-C, C++ and `.xcframework`
+  dependencies, macros, SwiftData, asset catalogs (compiled to `Assets.car`)
+  and resources.
+- **Tests on the device.** `peek test` runs your Swift Testing, XCTest and XCUITest
+  suites on the iPhone, with real UIKit and SwiftUI, every time you save.
+- **Debugging.** `// peek:break` stops at a line and shows values on the phone,
+  `// peek:log` prints them, and `--language` shows the app in another language.
 - **No Mac, no paid account.** A free Apple ID and SideStore, AltStore or
   LiveContainer is enough.
 - **Logs and screenshots.** `print()` output shows up in your terminal, and
@@ -429,6 +433,8 @@ in the link is used. Pair with `peek link --qr` at any time.
 | 0.2 on that phone: hot patching keeps `@State` across body edits, chained patches, closure changes, fallback to a full build | ✅ |
 | 0.2 on that phone: colour sets (light and dark), system colour references, asset symbols, image sets, string catalogs (plurals, Korean), C, Objective-C and C++ dependencies, static and dynamic `.xcframework`s, `DocumentGroup` | ✅ |
 | `peek test` on that phone: Swift Testing suites, parameterized tests, XCTest test cases, `ImageRenderer`, failures with file and line, re-run on save | ✅ |
+| 0.3 on that phone: XCUITest (taps, typing, gestures, other apps), SwiftData (`@Model`, `@Query`, `#Predicate`, relationships, `#Unique`, `#Index`, `@ModelActor`), asset catalogs with dark and @1x/@2x/@3x images (also in dependencies), `.xcodeproj` projects (classic groups and Xcode 16 folders), breakpoints, `--language`, the app's Info.plist keys and `Bundle.main` resources | ✅ |
+| Real apps on that phone: MensaDresden (Tuist), bev17 (`.xcodeproj` with local packages), an own SwiftData app (`.xcodeproj`) | ✅ |
 | Peek installed directly with SideStore / AltStore | ⏳ not yet |
 | Bonjour discovery on a real Wi-Fi network | ⏳ not yet |
 
