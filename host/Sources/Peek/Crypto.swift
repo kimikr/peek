@@ -3,8 +3,8 @@ import CryptoKit
 import Foundation
 
 /// The shared secret from the pairing link. It never travels over the network:
-/// requests are authenticated with an HMAC, and every body that matters (the certificate
-/// upload, screenshots, and all of the server's replies) is encrypted and authenticated.
+/// requests are authenticated with an HMAC, and the certificate upload, screenshots and all of
+/// the server's replies are encrypted and authenticated. Log output is only signed (see README).
 struct PairingKey: Equatable {
     let token: Data
 

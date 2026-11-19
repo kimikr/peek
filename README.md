@@ -407,6 +407,16 @@ in the link is used. Pair with `peek link --qr` at any time.
   A request captured on the network could be replayed within its 5-minute
   window; that only repeats something the phone already did, and the reply is
   still encrypted.
+- Known gaps, to be closed in a later release (they need a new protocol, so
+  app and server change together): what the previewed app prints (and
+  breakpoint values) is signed but sent from the phone unencrypted, so do not
+  print secrets on an untrusted network; and the server's encrypted replies are
+  not tied to the request they answer, so someone on the same Wi-Fi who
+  captured one can pose as the server (found by Bonjour) and replay old replies
+  to your phone. Over Tailscale neither is reachable from the local network.
+- The server refuses requests whose signature header is malformed or stale
+  before reading their body, drops clients that stay idle for two minutes, and
+  serves at most 64 requests at a time.
 
 ## Tested
 
