@@ -3681,20 +3681,21 @@ class Signer:
             write_private(work / "key.pem", key)
             write_private(work / "cert.pem", cert)
             write_private(work / "chain.pem", chain)
-            if self.p12.exists():
-                os.chmod(self.p12, 0o600)
-            else:
-                write_private(self.p12, b"")
+            # Exported next to the old one and swapped in only when complete: a failed export
+            # must not leave a broken certificate behind the one cert.json describes.
+            fresh = work / "cert.p12"
+            write_private(fresh, b"")
             cmd = ["pkcs12", "-export", "-inkey", str(work / "key.pem"), "-in", str(work / "cert.pem"),
-                   "-out", str(self.p12), "-passout", "pass:"]
+                   "-out", str(fresh), "-passout", "pass:"]
             if chain:
                 cmd += ["-certfile", str(work / "chain.pem")]
             done = self._openssl(*cmd)
             if done.returncode != 0:
                 raise ValueError("could not repack certificate: " + done.stderr.decode(errors="replace")[-200:])
+            os.chmod(fresh, 0o600)
+            os.replace(fresh, self.p12)
         finally:
             shutil.rmtree(work, ignore_errors=True)
-        os.chmod(self.p12, 0o600)
         self.info = {
             "team": team.group(1) if team else None,
             "name": common.group(1).replace("\\", "") if common else (subject or "certificate"),
@@ -3722,12 +3723,17 @@ class Signer:
     def sign(self, dylib):
         """Signs a copy of dylib and returns its path."""
         signed = dylib.with_name(f"{dylib.stem}.signed.dylib")
-        shutil.copyfile(dylib, signed)
+        # Signed in a copy that only takes the final name once ldid succeeded: callers treat an
+        # existing .signed.dylib as done.
+        partial = dylib.with_name(f"{dylib.stem}.signing.dylib")
+        shutil.copyfile(dylib, partial)
         proc = subprocess.run([self.tc.ldid, f"-K{self.p12}", "-U",
-                               *([f"-I{self.identifier}"] if self.identifier else []), "-S", str(signed)],
+                               *([f"-I{self.identifier}"] if self.identifier else []), "-S", str(partial)],
                               capture_output=True, text=True)
         if proc.returncode != 0:
+            partial.unlink(missing_ok=True)
             raise RuntimeError("ldid failed: " + (proc.stderr or proc.stdout).strip())
+        os.replace(partial, signed)
         return signed
 
     def fingerprint(self):
