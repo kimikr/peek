@@ -90,7 +90,7 @@ The pairing link lists the addresses the phone tries in turn:
 - **Your own domain.** Put a reverse proxy in front of the server and pass its
   address with its port: `peek dev MyApp --host dev.example.com:80`. The server
   then listens on loopback for the proxy, and the phone reaches it over mobile
-  data too. Requests and replies are encrypted end to end either way.
+  data too. Builds and the server's replies are encrypted end to end either way.
 
 `--host` can be given more than once (`--host 100.64.0.5 --host dev.example.com:80`).
 `peek link --qr` prints the link again.
